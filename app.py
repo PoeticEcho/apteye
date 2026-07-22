@@ -8,7 +8,7 @@ from datetime import datetime
 import numpy as np
 
 # --- 페이지 기본 설정 ---
-st.set_page_config(page_title="프롭테크 하이퍼 엔진 V28.4 Pro", layout="wide", initial_sidebar_state="expanded")
+st.set_page_config(page_title="프롭테크 하이퍼 엔진 V28.6 Pro", layout="wide", initial_sidebar_state="expanded")
 
 # --- UI 스타일링 ---
 st.markdown("""
@@ -84,18 +84,14 @@ def categorize_floor(floor_str):
     return '중층'
 
 def parse_transactions(text):
-    """
-    ✨ [V28.4 듀얼 파서 Engine]
-    1) 당일/일별 신규 브리핑 양식 ('84.93㎡ 35평 · 9층 중개거래 · 26.07.10 계약')
-    2) 다년도 목록/이력 양식 (2026년 -> 07.10 -> 84.9394㎡ 35B평 · 9층 -> 11억7천749)
-    """
+    """통합 실거래가 파서"""
     if not text.strip(): return pd.DataFrame()
     parsed = []
     
-    # --- 패턴 1: 당일/일별 신고형 파싱 ('계약' 문구가 포함된 한 줄 구조) ---
+    # --- 패턴 1: 당일/일별 신고형 파싱 ---
     b_blocks = re.split(r'(?=(?:[가-힣]+구|[가-힣]+동)\n|\n[가-힣0-9]+분양권|\n[가-힣0-9]+아파트)', text)
     for b_block in b_blocks:
-        contract_matches = re.finditer(r'([0-9]+억[0-9천\s,\.]*|[\d,]+만)[\s\S]{1,150}?([\d\.]+)㎡\s*(\d+[A-Z]?평)?[\s\S]{1,50}?(\d+)층(?:\s*(\d{3,4})동?)?[\s\S]{1,30}?(중개거래|직거래)?[\s\S]{1,30}?((?:20)?2[0-9]\.\d{2}\.\d{2})\s*계약', b_block)
+        contract_matches = re.finditer(r'([0-9]+억[0-9천\s,\.]*|[\d,]+만)[\s\S]{1,150}?([\d\.]+)㎡\s*(\d+[A-Z]?평)?[\s\S]{1,50}?(\d+)층(?:\s*(?<!\d)(\d{1,4})동?)?[\s\S]{1,30}?(중개거래|직거래)?[\s\S]{1,30}?((?:20)?2[0-9]\.\d{2}\.\d{2})\s*계약', b_block)
         for cm in contract_matches:
             p_str = cm.group(1).strip()
             area_val = float(cm.group(2))
@@ -126,7 +122,7 @@ def parse_transactions(text):
                     '데이터구분': '실거래'
                 })
 
-    # --- 패턴 2: 다년도 목록/이력형 파싱 (라인 스캐닝) ---
+    # --- 패턴 2: 다년도 목록/이력형 파싱 ---
     lines = [line.strip() for line in text.split('\n') if line.strip()]
     current_year = "2026"
     i = 0
@@ -166,9 +162,9 @@ def parse_transactions(text):
                 
             price_m = re.search(r'([0-9]+억[0-9천\s,\.]*|[\d,]+만)(?:\(고\))?', block_txt)
             type_m = re.search(r'([\d\.]+)[㎡]*\s*(\d+[A-Z]?평)?', block_txt)
-            floor_m = re.search(r'(\d+)층(?:\s+(\d{3,4})동?)?', block_txt)
+            floor_m = re.search(r'(\d+)층(?:\s+(?<!\d)(\d{1,4})\s*동?)?', block_txt)
             deal_type_m = re.search(r'(직거래|중개거래)', block_txt)
-            dong_bottom_m = re.search(r'\n(\d{3})\s*$', block_txt.strip())
+            dong_bottom_m = re.search(r'\n(?<!\d)(\d{1,4})\s*$', block_txt.strip())
             
             if price_m and type_m:
                 area_val = float(type_m.group(1))
@@ -198,24 +194,26 @@ def parse_transactions(text):
     df_res = pd.DataFrame(parsed)
     if df_res.empty: return df_res
     
-    # 금액 실수화
     df_res = process_price_columns(df_res)
-    
-    # 정밀 중복 제거 (동일 날짜, 동일 층수, 동일 금액이면 1건으로 통합)
     subset_cols = [c for c in ['날짜', '층', '금액_하한(억)'] if c in df_res.columns]
     return df_res.drop_duplicates(subset=subset_cols, keep='first')
 
 def parse_naver_listings(text):
-    """네이버 매매 매물 파싱"""
+    """
+    ✨ [V28.6 보완] 네이버 매매 매물 파서
+    - (?<!\d) 적용으로 104동이 4동으로 잘리는 현상 방지
+    """
     if not text.strip(): return pd.DataFrame()
     today_str = datetime.now().strftime("%Y-%m-%d")
     parsed = []
     
-    blocks = re.split(r'(?=(?:[가-힣0-9]+\s+)?\d+동\s*\n매매)', text)
+    # ✨ 부정 후방 탐색 (?<!\d) 추가로 동 번호 앞부분 숫자가 잘리는 현상 차단
+    blocks = re.split(r'(?=(?:[가-힣0-9()]+\s+)?(?<!\d)\d+동\s*\n?\s*매매)', text)
     for block in blocks:
         if "매매" not in block: continue
         
-        dong_m = re.search(r'(\d+동)', block)
+        # ✨ 동 추출 시에도 (?<!\d) 추가
+        dong_m = re.search(r'(?<!\d)(\d+동)', block)
         price_m = re.search(r'매매\s+([0-9억,\s~]+)', block)
         type_m = re.search(r'전용\s*([\d\.]+[A-Z]*)', block)
         
@@ -246,16 +244,19 @@ def parse_naver_listings(text):
     return pd.DataFrame(parsed)
 
 def parse_naver_rentals(text):
-    """네이버 전세 및 월세 매물 파싱"""
+    """
+    ✨ [V28.6 보완] 네이버 전월세 매물 파서
+    - (?<!\d) 적용으로 백 단위 동 번호 보존
+    """
     if not text.strip(): return pd.DataFrame()
     today_str = datetime.now().strftime("%Y-%m-%d")
     parsed = []
     
-    blocks = re.split(r'(?=(?:[가-힣0-9]+\s+)?\d+동\s*\n(?:전세|월세))', text)
+    blocks = re.split(r'(?=(?:[가-힣0-9()]+\s+)?(?<!\d)\d+동\s*\n?\s*(?:전세|월세))', text)
     for block in blocks:
         if "전세" not in block and "월세" not in block: continue
         
-        dong_m = re.search(r'(\d+동)', block)
+        dong_m = re.search(r'(?<!\d)(\d+동)', block)
         deal_kind = "전세" if "전세" in block else "월세"
         price_m = re.search(r'(?:전세|월세)\s+([0-9억,\s~/]+)', block)
         type_m = re.search(r'전용\s*([\d\.]+[A-Z]*)', block)
@@ -373,8 +374,6 @@ with st.sidebar:
                 for w in warnings: st.warning(w)
             
             if raw_list: update_db(pd.DataFrame(raw_list), RAW_DB_PATH, ['날짜', '단지명', '유형'])
-            
-            # ✨ [고유 1건 보장 중복제거 키 적용]
             update_db(pd.concat([parse_transactions(tx1).assign(단지명=name1) if tx1 else pd.DataFrame(), parse_transactions(tx2).assign(단지명=name2) if tx2 else pd.DataFrame()]), TX_DB_PATH, ['단지명', '날짜', '층', '금액_하한(억)'])
             update_db(pd.concat([parse_naver_listings(ls1).assign(단지명=name1) if ls1 else pd.DataFrame(), parse_naver_listings(ls2).assign(단지명=name2) if ls2 else pd.DataFrame()]), LISTING_DB_PATH, ['단지명', '수집일', '동', '타입', '금액_하한(억)', '층'])
             update_db(pd.concat([parse_naver_rentals(rn1).assign(단지명=name1) if rn1 else pd.DataFrame(), parse_naver_rentals(rn2).assign(단지명=name2) if rn2 else pd.DataFrame()]), RENTAL_DB_PATH, ['단지명', '수집일', '동', '타입', '거래구분', '보증금(억)', '층'])
@@ -419,7 +418,7 @@ with st.sidebar:
 
 # --- 3. 메인 분석 대시보드 ---
 
-st.title(f"🏙️ {selected_complex} 정밀 라이프사이클 V28.4 Pro")
+st.title(f"🏙️ {selected_complex} 정밀 라이프사이클 V28.6 Pro")
 
 if os.path.exists(LISTING_DB_PATH):
     ls_df = pd.read_csv(LISTING_DB_PATH)
