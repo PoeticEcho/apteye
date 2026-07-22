@@ -8,7 +8,7 @@ from datetime import datetime
 import numpy as np
 
 # --- 페이지 기본 설정 ---
-st.set_page_config(page_title="프롭테크 하이퍼 엔진 V28.16 Pro", layout="wide", initial_sidebar_state="expanded")
+st.set_page_config(page_title="프롭테크 하이퍼 엔진 V28.17 Pro", layout="wide", initial_sidebar_state="expanded")
 
 # --- UI 스타일링 ---
 st.markdown("""
@@ -97,92 +97,56 @@ def is_valid_date(y, m, d):
     except:
         return False
 
-def preprocess_raw_text(text):
-    """
-    ✨ [V28.16 전처리기] 
-    복사 붙여넣기로 날짜와 면적 사이에 줄바꿈이 유실되어 '07.17114.9694'처럼 붙은 경우 강제 개행 삽입
-    """
-    if not text: return ""
-    # MM.DD 뒤에 바로 숫자가 붙는 경우 줄바꿈 삽입
-    text = re.sub(r'(\d{2}\.\d{2})(\d{2,3}\.\d+)', r'\1\n\2', text)
-    return text
-
 def parse_transactions(text):
+    """
+    ✨ [V28.17 통합 실거래가 파서]
+    - 네이버페이 실거래가 표 양식 ('6월 23일 ... 27층 ... 10억 7,014') 완벽 지원
+    - 당일 신고형 및 다년도 목록형 통합 대응
+    """
     if not text.strip(): return pd.DataFrame()
-    text = preprocess_raw_text(text)
     parsed = []
     
-    lines = text.split('\n')
+    lines = [l.strip() for l in text.split('\n') if l.strip()]
     curr_y = "2026"
-    for line in lines:
-        line_s = line.strip()
-        y_match = re.search(r'(202[0-9])년', line_s)
+    
+    i = 0
+    while i < len(lines):
+        line = lines[i]
+        
+        # 연도 감지
+        y_match = re.search(r'(202[0-9])년', line)
         if y_match:
             curr_y = y_match.group(1)
 
-        if "계약취소" in line_s or "해지" in line_s:
+        # 해지/계약취소 건 스킵
+        if "계약취소" in line or "해지" in line:
+            i += 1
             continue
 
-        tbl_m = re.search(r'(\d{1,2})월\s*(\d{1,2})일\s+.*?\b(\d+)층\s+.*?(?:직거래|최고|최저)?\s*([0-9]+억[0-9천\s,\.]*)', line_s)
-        if tbl_m:
-            mm_str, dd_str = tbl_m.group(1), tbl_m.group(2)
-            if is_valid_date(curr_y, mm_str, dd_str):
+        # 1. 네이버페이 실거래가 표 양식 파싱 (예: "6월 23일	분양권	27층	10억 7,014" 또는 공백으로 붙은 형태)
+        table_row_m = re.search(r'(\d{1,2})월\s*(\d{1,2})일.*?\b(\d+)층.*?([0-9]+억[0-9천\s,\.]*)', line)
+        if table_row_m:
+            mm, dd = table_row_m.group(1).zfill(2), table_row_m.group(2. if False else 2).zfill(2)
+            floor_v = table_row_m.group(3)
+            price_v = table_row_m.group(4).strip()
+            
+            if is_valid_date(curr_y, mm, dd):
                 parsed.append({
-                    '날짜': f"{curr_y}.{mm_str.zfill(2)}.{dd_str.zfill(2)}",
+                    '날짜': f"{curr_y}.{mm}.{dd}",
                     '타입': "전체", 
-                    '금액_문자열': tbl_m.group(4),
-                    '층': tbl_m.group(3),
+                    '금액_문자열': price_v,
+                    '층': floor_v,
                     '동': "동미상",
-                    '거래유형': "직거래" if "직거래" in line_s else "중개거래",
+                    '거래유형': "직거래" if "직거래" in line else "중개거래",
                     '데이터구분': '실거래'
                 })
+            i += 1
+            continue
 
-    b_blocks = re.split(r'(?=(?:[가-힣]+구|[가-힣]+동)\n|\n[가-힣0-9]+분양권|\n[가-힣0-9]+아파트)', text)
-    for b_block in b_blocks:
-        contract_matches = re.finditer(r'([0-9]+억[0-9천\s,\.]*|[\d,]+만)[\s\S]{1,150}?([\d\.]+)㎡\s*(\d+[A-Z]?평)?[\s\S]{1,50}?(\d+)층(?:\s*(?<!\d)(\d{1,4})동?)?[\s\S]{1,30}?(중개거래|직거래)?[\s\S]{1,30}?((?:20)?2[0-9]\.\d{2}\.\d{2})\s*계약', b_block)
-        for cm in contract_matches:
-            p_str = cm.group(1).strip()
-            area_val = float(cm.group(2))
-            pyeong_str = cm.group(3) if cm.group(3) else ""
-            floor_str = cm.group(4)
-            dong_str = f"{cm.group(5)}동" if cm.group(5) else "동미상"
-            deal_type = cm.group(6) if cm.group(6) else "중개거래"
-            date_raw = cm.group(7)
-
-            if date_raw.startswith('26.') or date_raw.startswith('25.') or date_raw.startswith('24.'):
-                full_date = f"20{date_raw}"
-            else:
-                full_date = date_raw
-
-            date_parts = full_date.split('.')
-            if len(date_parts) == 3 and is_valid_date(date_parts[0], date_parts[1], date_parts[2]):
-                if 10.0 <= area_val <= 300.0:
-                    area_base = f"{area_val:.2f}".rstrip('0').rstrip('.') if '.' in str(area_val) else str(int(area_val))
-                    alpha_m = re.search(r'([A-Z])평', pyeong_str)
-                    if alpha_m and not area_base.endswith(alpha_m.group(1)):
-                        area_base += alpha_m.group(1)
-
-                    parsed.append({
-                        '날짜': full_date, 
-                        '타입': area_base, 
-                        '금액_문자열': p_str,
-                        '층': floor_str, 
-                        '동': dong_str,
-                        '거래유형': deal_type, 
-                        '데이터구분': '실거래'
-                    })
-
-    current_year = "2026"
-    i = 0
-    while i < len(lines):
-        line = lines[i].strip()
-        y_m = re.search(r'(202[0-9])년', line)
-        if y_m:
-            current_year = y_m.group(1)
-            
+        # 2. 날짜 패턴형 파싱 (07.17 또는 2026.07.17)
         date_m = re.match(r'^((?:20)?2[0-9])?\.?(\d{2})\.(\d{2})', line)
         if date_m:
-            yr = date_m.group(1) if date_m.group(1) else current_year
+            yr = date_m.group(1) if date_m.group(1) else curr_y
             if len(yr) == 2: yr = f"20{yr}"
             mm, dd = date_m.group(2), date_m.group(3)
             
@@ -191,8 +155,8 @@ def parse_transactions(text):
                 block_lines = [line]
                 j = i + 1
                 while j < len(lines):
-                    next_line = lines[j].strip()
-                    if re.search(r'(202[0-9])년', next_line) or re.match(r'^((?:20)?2[0-9])?\.?(\d{2})\.(\d{2})', next_line):
+                    next_line = lines[j]
+                    if re.search(r'(202[0-9])년', next_line) or re.match(r'^((?:20)?2[0-9])?\.?(\d{2})\.(\d{2})', next_line) or re.search(r'\d{1,2}월\s*\d{1,2}일', next_line):
                         break
                     block_lines.append(next_line)
                     j += 1
@@ -207,38 +171,28 @@ def parse_transactions(text):
                 type_m = re.search(r'([\d\.]+)[㎡]*\s*(\d+[A-Z]?평)?', block_txt)
                 floor_m = re.search(r'(\d+)층(?:\s+(?<!\d)(\d{1,4})\s*동?)?', block_txt)
                 deal_type_m = re.search(r'(직거래|중개거래)', block_txt)
-                dong_bottom_m = re.search(r'\n(?<!\d)(\d{1,4})\s*$', block_txt.strip())
                 
-                if price_m and type_m:
-                    area_val = float(type_m.group(1))
-                    if 10.0 <= area_val <= 300.0:
-                        area_base = f"{area_val:.2f}".rstrip('0').rstrip('.') if '.' in str(area_val) else str(int(area_val))
-                        pyeong_str = type_m.group(2) if type_m.group(2) else ""
-                        alpha_m = re.search(r'([A-Z])평', pyeong_str)
-                        if alpha_m and not area_base.endswith(alpha_m.group(1)):
-                            area_base += alpha_m.group(1)
-                            
-                        dong_str = f"{floor_m.group(2)}동" if floor_m and floor_m.group(2) else ("동미상" if not dong_bottom_m else f"{dong_bottom_m.group(1)}동")
-                        
-                        parsed.append({
-                            '날짜': full_date, 
-                            '타입': area_base, 
-                            '금액_문자열': price_m.group(1).strip(),
-                            '층': floor_m.group(1) if floor_m else "0", 
-                            '동': dong_str,
-                            '거래유형': deal_type_m.group(1) if deal_type_m else "중개거래", 
-                            '데이터구분': '실거래'
-                        })
-            else:
-                i += 1
-        else:
-            i += 1
+                if price_m:
+                    area_val = float(type_m.group(1)) if type_m else 84.0
+                    area_base = f"{area_val:.2f}".rstrip('0').rstrip('.') if type_m else "전체"
+                    
+                    parsed.append({
+                        '날짜': full_date, 
+                        '타입': area_base, 
+                        '금액_문자열': price_m.group(1).strip(),
+                        '층': floor_m.group(1) if floor_m else "0", 
+                        '동': "동미상",
+                        '거래유형': deal_type_m.group(1) if deal_type_m else "중개거래", 
+                        '데이터구분': '실거래'
+                    })
+                continue
+
+        i += 1
 
     df_res = pd.DataFrame(parsed)
     if df_res.empty: return df_res
     
     df_res = process_price_columns(df_res)
-    # ✨ [V28.16 핵심] 고유 지문 중복 차단 키 확장 (날짜, 타입, 층, 금액)
     subset_cols = [c for c in ['날짜', '타입', '층', '금액_하한(억)'] if c in df_res.columns]
     return df_res.drop_duplicates(subset=subset_cols, keep='first')
 
@@ -401,27 +355,33 @@ with st.sidebar:
     
     with st.popover("⚙️ 스마트 데이터 입력 & DB 정제", use_container_width=True):
         st.subheader("📥 개별 단지 스마트 입력 센터")
-        st.caption("💡 원문을 복사해 넣고 하단 '저장' 버튼을 누르면 자동 파싱 후 입력창이 비워집니다.")
+        st.caption("💡 원문을 붙여넣고 저장 버튼을 누르면 자동 파싱 후 입력창이 비워집니다.")
         
         # --- 단지 1 섹션 ---
         st.markdown("---")
         name1 = st.text_input("🏢 단지 1 이름", value="범어자이(주상복합)", key="n1")
         raw1 = st.text_area("단지 1 원문 입력", value=st.session_state['raw_text_1'], height=150, key="r1_input", help="매매, 전월세, 실거래가 원문 텍스트를 붙여넣으세요.")
         
-        if st.button("💾 [단지 1] 데이터 파싱 및 저장", use_container_width=True):
-            if raw1.strip():
-                if "범어자이" in name1 and ("오페라" in raw1 or "고성동" in raw1):
-                    st.warning(f"⚠️ [{name1}] 입력 칸에 다른 단지 원문이 섞여 있는 것 같습니다.")
-                
-                tx_c, ls_c, rn_c = smart_auto_parse_and_update(raw1, name1)
+        c_btn1, c_clr1 = st.columns(2)
+        with c_btn1:
+            if st.button("💾 [단지 1] 저장", use_container_width=True):
+                if raw1.strip():
+                    if "범어자이" in name1 and ("오페라" in raw1 or "고성동" in raw1):
+                        st.warning(f"⚠️ [{name1}] 입력 칸에 다른 단지 원문이 섞여 있는 것 같습니다.")
+                    
+                    tx_c, ls_c, rn_c = smart_auto_parse_and_update(raw1, name1)
+                    st.session_state['raw_text_1'] = ""
+                    
+                    total_c = tx_c + ls_c + rn_c
+                    if total_c > 0:
+                        st.toast(f"🎉 [{name1}] {total_c}건 파싱 성공! (실거래 {tx_c}, 매매 {ls_c}, 전월세 {rn_c})", icon="✅")
+                        st.success(f"✅ [{name1}] 성공: 실거래가 {tx_c}건 / 매매호가 {ls_c}건 / 전월세 {rn_c}건 적재됨")
+                    else:
+                        st.warning(f"⚠️ [{name1}] 파싱된 매물이 없습니다. 포맷을 확인하세요.")
+                    st.rerun()
+        with c_clr1:
+            if st.button("🧹 [단지 1] 지우기", use_container_width=True):
                 st.session_state['raw_text_1'] = ""
-                
-                total_c = tx_c + ls_c + rn_c
-                if total_c > 0:
-                    st.toast(f"🎉 [{name1}] {total_c}건 파싱 완료! (실거래 {tx_c}건, 매매 {ls_c}건, 전월세 {rn_c}건)", icon="✅")
-                    st.success(f"✅ [{name1}] 파싱 완료: 실거래가 {tx_c}건 / 매매호가 {ls_c}건 / 전월세 {rn_c}건 적재됨")
-                else:
-                    st.warning(f"⚠️ [{name1}] 파싱된 매물이 없습니다. 원문 포맷을 확인하세요.")
                 st.rerun()
 
         # --- 단지 2 섹션 ---
@@ -429,20 +389,26 @@ with st.sidebar:
         name2 = st.text_input("🏢 단지 2 이름", value="대구역오페라더블유(주상복합)", key="n2")
         raw2 = st.text_area("단지 2 원문 입력", value=st.session_state['raw_text_2'], height=150, key="r2_input", help="매매, 전월세, 실거래가 원문 텍스트를 붙여넣으세요.")
         
-        if st.button("💾 [단지 2] 데이터 파싱 및 저장", use_container_width=True):
-            if raw2.strip():
-                if "오페라" in name2 and ("범어" in raw2 or "수성구" in raw2):
-                    st.warning(f"⚠️ [{name2}] 입력 칸에 다른 단지 원문이 섞여 있는 것 같습니다.")
-                
-                tx_c, ls_c, rn_c = smart_auto_parse_and_update(raw2, name2)
+        c_btn2, c_clr2 = st.columns(2)
+        with c_btn2:
+            if st.button("💾 [단지 2] 저장", use_container_width=True):
+                if raw2.strip():
+                    if "오페라" in name2 and ("범어" in raw2 or "수성구" in raw2):
+                        st.warning(f"⚠️ [{name2}] 입력 칸에 다른 단지 원문이 섞여 있는 것 같습니다.")
+                    
+                    tx_c, ls_c, rn_c = smart_auto_parse_and_update(raw2, name2)
+                    st.session_state['raw_text_2'] = ""
+                    
+                    total_c = tx_c + ls_c + rn_c
+                    if total_c > 0:
+                        st.toast(f"🎉 [{name2}] {total_c}건 파싱 성공! (실거래 {tx_c}, 매매 {ls_c}, 전월세 {rn_c})", icon="✅")
+                        st.success(f"✅ [{name2}] 성공: 실거래가 {tx_c}건 / 매매호가 {ls_c}건 / 전월세 {rn_c}건 적재됨")
+                    else:
+                        st.warning(f"⚠️ [{name2}] 파싱된 매물이 없습니다. 포맷을 확인하세요.")
+                    st.rerun()
+        with c_clr2:
+            if st.button("🧹 [단지 2] 지우기", use_container_width=True):
                 st.session_state['raw_text_2'] = ""
-                
-                total_c = tx_c + ls_c + rn_c
-                if total_c > 0:
-                    st.toast(f"🎉 [{name2}] {total_c}건 파싱 완료! (실거래 {tx_c}건, 매매 {ls_c}건, 전월세 {rn_c}건)", icon="✅")
-                    st.success(f"✅ [{name2}] 파싱 완료: 실거래가 {tx_c}건 / 매매호가 {ls_c}건 / 전월세 {rn_c}건 적재됨")
-                else:
-                    st.warning(f"⚠️ [{name2}] 파싱된 매물이 없습니다. 원문 포맷을 확인하세요.")
                 st.rerun()
 
         st.markdown("---")
@@ -491,7 +457,7 @@ with st.sidebar:
 
 # --- 3. 메인 분석 대시보드 ---
 
-st.title(f"🏙️ {selected_complex} 정밀 라이프사이클 V28.16 Pro")
+st.title(f"🏙️ {selected_complex} 정밀 라이프사이클 V28.17 Pro")
 
 ls_df = pd.read_csv(LISTING_DB_PATH) if os.path.exists(LISTING_DB_PATH) else pd.DataFrame()
 tx_df = pd.read_csv(TX_DB_PATH) if os.path.exists(TX_DB_PATH) else pd.DataFrame()
