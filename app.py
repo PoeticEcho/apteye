@@ -8,7 +8,7 @@ from datetime import datetime
 import numpy as np
 
 # --- 페이지 기본 설정 ---
-st.set_page_config(page_title="프롭테크 하이퍼 엔진 V28.11 Pro", layout="wide", initial_sidebar_state="expanded")
+st.set_page_config(page_title="프롭테크 하이퍼 엔진 V28.12 Pro", layout="wide", initial_sidebar_state="expanded")
 
 # --- UI 스타일링 ---
 st.markdown("""
@@ -31,7 +31,7 @@ RAW_DB_PATH = 'raw_inputs_db.csv'
 
 def convert_price_single(p_str):
     """
-    ✨ [V28.11] 실거래가/호가 한글 원문 정밀 가격 파서
+    ✨ [V28.12] 실거래가/호가 한글 원문 정밀 가격 파서
     - '11억3' -> 11.0003 (11억 3만원)
     - '11억3천3' -> 11.3003 (11억 3003만원)
     - '11억303' -> 11.0303 (11억 303만원)
@@ -98,7 +98,9 @@ def categorize_floor(floor_str):
     return '중층'
 
 def parse_transactions(text):
-    """통합 실거래가 파서"""
+    """
+    ✨ [V28.12 고도화] 날짜와 면적이 붙은 문장('07.17114.9694㎡') 정밀 분리 파서
+    """
     if not text.strip(): return pd.DataFrame()
     parsed = []
     
@@ -136,7 +138,7 @@ def parse_transactions(text):
                     '데이터구분': '실거래'
                 })
 
-    # --- 패턴 2: 다년도 목록/이력형 파싱 ---
+    # --- 패턴 2: 다년도 목록/이력형 파싱 (붙은 날짜 대응) ---
     lines = [line.strip() for line in text.split('\n') if line.strip()]
     current_year = "2026"
     i = 0
@@ -147,7 +149,8 @@ def parse_transactions(text):
         if y_m:
             current_year = y_m.group(1)
             
-        date_m = re.match(r'^((?:20)?2[0-9]\.\d{2}\.\d{2}|\d{2}\.\d{2})$', line)
+        # ✨ 날짜가 면적과 붙어있는 형태(^07.17114.9694m2) 감지
+        date_m = re.match(r'^((?:20)?2[0-9]\.\d{2}\.\d{2}|\d{2}\.\d{2})', line)
         if date_m:
             date_raw = date_m.group(1)
             if len(date_raw) == 5:
@@ -161,7 +164,7 @@ def parse_transactions(text):
             j = i + 1
             while j < len(lines):
                 next_line = lines[j]
-                if re.search(r'(202[0-9])년', next_line) or re.match(r'^((?:20)?2[0-9]\.\d{2}\.\d{2}|\d{2}\.\d{2})$', next_line):
+                if re.search(r'(202[0-9])년', next_line) or re.match(r'^((?:20)?2[0-9]\.\d{2}\.\d{2}|\d{2}\.\d{2})', next_line):
                     break
                 block_lines.append(next_line)
                 j += 1
@@ -209,7 +212,7 @@ def parse_transactions(text):
     return df_res.drop_duplicates(subset=subset_cols, keep='first')
 
 def parse_naver_listings(text):
-    """✨ [V28.11 고도화] 네이버 매매 매물 파서 (유연한 날짜 감지)"""
+    """네이버 매매 매물 파서"""
     if not text.strip(): return pd.DataFrame()
     today_str = datetime.now().strftime("%Y-%m-%d")
     parsed = []
@@ -226,7 +229,6 @@ def parse_naver_listings(text):
         if not floor_dir_m:
             floor_dir_m = re.search(r'([가-힣0-9]+)/\d+층((?:남서|남동|북서|북동|남|북|동|서)향)?', block)
 
-        # ✨ 유연한 날짜 추출 (집주인확인매물 / 확인매물 / 등록 모두 대응)
         date_m = re.search(r'(202[3-6]\.\d{2}\.\d{2})', block)
         broker_cnt_m = re.search(r'중개사\s*(\d+)곳', block)
         
@@ -250,7 +252,7 @@ def parse_naver_listings(text):
     return pd.DataFrame(parsed)
 
 def parse_naver_rentals(text):
-    """✨ [V28.11 고도화] 네이버 전월세 매물 파서 (유연한 날짜/가격 감지)"""
+    """네이버 전월세 매물 파서"""
     if not text.strip(): return pd.DataFrame()
     today_str = datetime.now().strftime("%Y-%m-%d")
     parsed = []
@@ -262,7 +264,6 @@ def parse_naver_rentals(text):
         dong_m = re.search(r'(?<!\d)(\d+동)', block)
         deal_kind = "전세" if re.search(r'(?<!\d)\d+동\s*\n?\s*전세', block) else "월세"
         
-        # 줄바꿈 이탈 없는 정밀 한 줄 가격 파싱
         price_m = re.search(r'(?:전세|월세)[^\S\r\n]+([0-9억,~\-\s/]+)', block)
         type_m = re.search(r'전용\s*([\d\.]+[A-Z]*)', block)
         
@@ -270,7 +271,6 @@ def parse_naver_rentals(text):
         if not floor_dir_m:
             floor_dir_m = re.search(r'([가-힣0-9]+)/\d+층((?:남서|남동|북서|북동|남|북|동|서)향)?', block)
 
-        # ✨ 유연한 날짜 추출
         date_m = re.search(r'(202[3-6]\.\d{2}\.\d{2})', block)
         broker_cnt_m = re.search(r'중개사\s*(\d+)곳', block)
 
@@ -410,7 +410,6 @@ with st.sidebar:
 
     st.markdown("---")
     
-    # ✨ DB에 존재하는 모든 단지 목록 통합 수집
     all_known_complexes = set()
     for path in [LISTING_DB_PATH, RENTAL_DB_PATH, TX_DB_PATH]:
         if os.path.exists(path):
@@ -432,7 +431,7 @@ with st.sidebar:
 
 # --- 3. 메인 분석 대시보드 ---
 
-st.title(f"🏙️ {selected_complex} 정밀 라이프사이클 V28.11 Pro")
+st.title(f"🏙️ {selected_complex} 정밀 라이프사이클 V28.12 Pro")
 
 ls_df = pd.read_csv(LISTING_DB_PATH) if os.path.exists(LISTING_DB_PATH) else pd.DataFrame()
 tx_df = pd.read_csv(TX_DB_PATH) if os.path.exists(TX_DB_PATH) else pd.DataFrame()
@@ -442,7 +441,6 @@ target_ls = ls_df[ls_df['단지명'] == selected_complex].copy() if not ls_df.em
 target_tx = tx_df[tx_df['단지명'] == selected_complex].copy() if not tx_df.empty else pd.DataFrame()
 target_rn = rn_df[rn_df['단지명'] == selected_complex].copy() if not rn_df.empty else pd.DataFrame()
 
-# 데이터 존재 여부 통합 체크 (매매 호가가 없더라도 전월세/실거래가가 있으면 정상 렌더링)
 has_data = not target_ls.empty or not target_tx.empty or not target_rn.empty
 
 if has_data:
