@@ -8,7 +8,7 @@ from datetime import datetime
 import numpy as np
 
 # --- 페이지 기본 설정 ---
-st.set_page_config(page_title="프롭테크 하이퍼 엔진 V28.2 Pro", layout="wide", initial_sidebar_state="expanded")
+st.set_page_config(page_title="프롭테크 하이퍼 엔진 V28.4 Pro", layout="wide", initial_sidebar_state="expanded")
 
 # --- UI 스타일링 ---
 st.markdown("""
@@ -84,59 +84,126 @@ def categorize_floor(floor_str):
     return '중층'
 
 def parse_transactions(text):
-    """통합 실거래가 파서 (면적 유효성 검증 로직 반영으로 '7.1' 같은 오파싱 방지)"""
+    """
+    ✨ [V28.4 듀얼 파서 Engine]
+    1) 당일/일별 신규 브리핑 양식 ('84.93㎡ 35평 · 9층 중개거래 · 26.07.10 계약')
+    2) 다년도 목록/이력 양식 (2026년 -> 07.10 -> 84.9394㎡ 35B평 · 9층 -> 11억7천749)
+    """
     if not text.strip(): return pd.DataFrame()
     parsed = []
     
-    blocks = re.split(r'(?=(?:(?:20)?2[3-6]\.\d{2}\.\d{2}|\d{2}\.\d{2})\s*)', text)
+    # --- 패턴 1: 당일/일별 신고형 파싱 ('계약' 문구가 포함된 한 줄 구조) ---
+    b_blocks = re.split(r'(?=(?:[가-힣]+구|[가-힣]+동)\n|\n[가-힣0-9]+분양권|\n[가-힣0-9]+아파트)', text)
+    for b_block in b_blocks:
+        contract_matches = re.finditer(r'([0-9]+억[0-9천\s,\.]*|[\d,]+만)[\s\S]{1,150}?([\d\.]+)㎡\s*(\d+[A-Z]?평)?[\s\S]{1,50}?(\d+)층(?:\s*(\d{3,4})동?)?[\s\S]{1,30}?(중개거래|직거래)?[\s\S]{1,30}?((?:20)?2[0-9]\.\d{2}\.\d{2})\s*계약', b_block)
+        for cm in contract_matches:
+            p_str = cm.group(1).strip()
+            area_val = float(cm.group(2))
+            pyeong_str = cm.group(3) if cm.group(3) else ""
+            floor_str = cm.group(4)
+            dong_str = f"{cm.group(5)}동" if cm.group(5) else "동미상"
+            deal_type = cm.group(6) if cm.group(6) else "중개거래"
+            date_raw = cm.group(7)
+
+            if date_raw.startswith('26.') or date_raw.startswith('25.') or date_raw.startswith('24.'):
+                full_date = f"20{date_raw}"
+            else:
+                full_date = date_raw
+
+            if 10.0 <= area_val <= 300.0:
+                area_base = f"{area_val:.2f}".rstrip('0').rstrip('.') if '.' in str(area_val) else str(int(area_val))
+                alpha_m = re.search(r'([A-Z])평', pyeong_str)
+                if alpha_m and not area_base.endswith(alpha_m.group(1)):
+                    area_base += alpha_m.group(1)
+
+                parsed.append({
+                    '날짜': full_date, 
+                    '타입': area_base, 
+                    '금액_문자열': p_str,
+                    '층': floor_str, 
+                    '동': dong_str,
+                    '거래유형': deal_type, 
+                    '데이터구분': '실거래'
+                })
+
+    # --- 패턴 2: 다년도 목록/이력형 파싱 (라인 스캐닝) ---
+    lines = [line.strip() for line in text.split('\n') if line.strip()]
     current_year = "2026"
-    
-    for block in blocks:
-        if not block.strip(): continue
-        if "해지" in block: continue
+    i = 0
+    while i < len(lines):
+        line = lines[i]
         
-        if "2025년" in block: current_year = "2025"
-        if "2026년" in block: current_year = "2026"
-        
-        date_m = re.search(r'((?:20)?2[3-6]\.\d{2}\.\d{2}|\d{2}\.\d{2})', block)
-        price_m = re.search(r'([0-9]+억[0-9천\s,\.]*|[\d,]+만)(?:\(고\))?', block)
-        type_m = re.search(r'([\d\.]+)[㎡]*\s*(\d+[A-Z]?평)?', block)
-        floor_m = re.search(r'(\d+)층(?:\s+(\d{3,4})동?)?', block)
-        deal_type_m = re.search(r'(직거래|중개거래)', block)
-        dong_bottom_m = re.search(r'\n(\d{3})\s*$', block.strip())
-        
-        if date_m and price_m and type_m:
-            area_val = float(type_m.group(1))
+        y_m = re.match(r'^(202[0-9])년?$', line)
+        if y_m:
+            current_year = y_m.group(1)
+            i += 1
+            continue
             
-            # ✨ [유효성 검증] 면적이 10㎡ 미만이거나 300㎡ 초과인 오파싱 데이터 필터링 ('7.1' 방지)
-            if area_val < 10.0 or area_val > 300.0:
+        date_m = re.match(r'^((?:20)?2[0-9]\.\d{2}\.\d{2}|\d{2}\.\d{2})$', line)
+        if date_m:
+            date_raw = date_m.group(1)
+            if len(date_raw) == 5:
+                full_date = f"{current_year}.{date_raw}"
+            elif date_raw.startswith('26.') or date_raw.startswith('25.') or date_raw.startswith('24.'):
+                full_date = f"20{date_raw}"
+            else:
+                full_date = date_raw
+            
+            block_lines = [line]
+            j = i + 1
+            while j < len(lines):
+                next_line = lines[j]
+                if re.match(r'^(202[0-9])년?$', next_line) or re.match(r'^((?:20)?2[0-9]\.\d{2}\.\d{2}|\d{2}\.\d{2})$', next_line):
+                    break
+                block_lines.append(next_line)
+                j += 1
+            
+            block_txt = "\n".join(block_lines)
+            i = j
+            
+            if "해지" in block_txt:
                 continue
-
-            date_str = date_m.group(1)
-            if len(date_str) == 5:
-                date_str = f"{current_year}.{date_str}"
-            elif date_str.startswith('26.'):
-                date_str = '20' + date_str
-            
-            area_base = f"{area_val:.2f}".rstrip('0').rstrip('.') if '.' in str(area_val) else str(int(area_val))
-            
-            pyeong_str = type_m.group(2) if type_m.group(2) else ""
-            alpha_m = re.search(r'([A-Z])평', pyeong_str)
-            if alpha_m and not area_base.endswith(alpha_m.group(1)):
-                area_base += alpha_m.group(1)
                 
-            dong_str = f"{floor_m.group(2)}동" if floor_m and floor_m.group(2) else ("동미상" if not dong_bottom_m else f"{dong_bottom_m.group(1)}동")
+            price_m = re.search(r'([0-9]+억[0-9천\s,\.]*|[\d,]+만)(?:\(고\))?', block_txt)
+            type_m = re.search(r'([\d\.]+)[㎡]*\s*(\d+[A-Z]?평)?', block_txt)
+            floor_m = re.search(r'(\d+)층(?:\s+(\d{3,4})동?)?', block_txt)
+            deal_type_m = re.search(r'(직거래|중개거래)', block_txt)
+            dong_bottom_m = re.search(r'\n(\d{3})\s*$', block_txt.strip())
+            
+            if price_m and type_m:
+                area_val = float(type_m.group(1))
+                if area_val < 10.0 or area_val > 300.0:
+                    continue
+                    
+                area_base = f"{area_val:.2f}".rstrip('0').rstrip('.') if '.' in str(area_val) else str(int(area_val))
+                pyeong_str = type_m.group(2) if type_m.group(2) else ""
+                alpha_m = re.search(r'([A-Z])평', pyeong_str)
+                if alpha_m and not area_base.endswith(alpha_m.group(1)):
+                    area_base += alpha_m.group(1)
+                    
+                dong_str = f"{floor_m.group(2)}동" if floor_m and floor_m.group(2) else ("동미상" if not dong_bottom_m else f"{dong_bottom_m.group(1)}동")
+                
+                parsed.append({
+                    '날짜': full_date, 
+                    '타입': area_base, 
+                    '금액_문자열': price_m.group(1).strip(),
+                    '층': floor_m.group(1) if floor_m else "0", 
+                    '동': dong_str,
+                    '거래유형': deal_type_m.group(1) if deal_type_m else "중개거래", 
+                    '데이터구분': '실거래'
+                })
+        else:
+            i += 1
 
-            parsed.append({
-                '날짜': date_str, 
-                '타입': area_base, 
-                '금액_문자열': price_m.group(1).strip(),
-                '층': floor_m.group(1) if floor_m else "0", 
-                '동': dong_str,
-                '거래유형': deal_type_m.group(1) if deal_type_m else "중개거래", 
-                '데이터구분': '실거래'
-            })
-    return pd.DataFrame(parsed).drop_duplicates()
+    df_res = pd.DataFrame(parsed)
+    if df_res.empty: return df_res
+    
+    # 금액 실수화
+    df_res = process_price_columns(df_res)
+    
+    # 정밀 중복 제거 (동일 날짜, 동일 층수, 동일 금액이면 1건으로 통합)
+    subset_cols = [c for c in ['날짜', '층', '금액_하한(억)'] if c in df_res.columns]
+    return df_res.drop_duplicates(subset=subset_cols, keep='first')
 
 def parse_naver_listings(text):
     """네이버 매매 매물 파싱"""
@@ -225,6 +292,7 @@ def parse_naver_rentals(text):
     return pd.DataFrame(parsed)
 
 def update_db(new_df, db_path, subset_keys):
+    """DB 누적 및 중복 제거 업데이트"""
     if new_df.empty: return True
     if '금액_문자열' in new_df.columns and '보증금(억)' not in new_df.columns: 
         new_df = process_price_columns(new_df)
@@ -239,9 +307,8 @@ def update_db(new_df, db_path, subset_keys):
         return True
     except: return False
 
-# ✨ [V28.2 신규] 단지 데이터 삭제 함수
 def delete_complex_data(complex_name):
-    """지정한 단지의 모든 데이터(매매, 전월세, 실거래, 원문)를 DB에서 완전 제거"""
+    """지정한 단지의 모든 데이터를 DB에서 완전 제거"""
     paths_keys = [
         (LISTING_DB_PATH, '단지명'),
         (RENTAL_DB_PATH, '단지명'),
@@ -255,7 +322,6 @@ def delete_complex_data(complex_name):
                 filtered_df = df[df[col] != complex_name]
                 filtered_df.to_csv(path, index=False, encoding='utf-8-sig')
 
-# ✨ [V28.2 신규] 최근 수집 스냅샷 롤백 함수
 def rollback_last_snapshot():
     """가장 최근 날짜의 입력 데이터를 전체 DB에서 롤백(제거)"""
     for path in [LISTING_DB_PATH, RENTAL_DB_PATH, TX_DB_PATH, RAW_DB_PATH]:
@@ -286,18 +352,14 @@ with st.sidebar:
             ls2 = st.text_area("단지 2 매매 호가 원문", height=80, key="l2")
             rn2 = st.text_area("단지 2 전월세 원문", height=80, key="r2")
 
-        # ✨ [V28.2 신규] 교차 검증 경고 및 저장 로직
         if st.button("💾 데이터 스냅샷 저장", use_container_width=True):
             today = datetime.now().strftime("%Y-%m-%d")
             raw_list = []
-            
-            # 교차 검증 메세지 저장용
             warnings = []
             
             for name, tx, ls, rn in [(name1, tx1, ls1, rn1), (name2, tx2, ls2, rn2)]:
                 combined_txt = tx + ls + rn
                 
-                # 교차 검증: 다른 아파트 주요 키워드가 포함되어 있는지 체크
                 if "범어자이" in name and ("오페라" in combined_txt or "고성동" in combined_txt):
                     warnings.append(f"⚠️ [{name}] 입력 칸에 다른 단지(오페라W) 원문이 섞여 있는 것 같습니다.")
                 elif "오페라" in name and ("범어" in combined_txt or "수성구" in combined_txt):
@@ -311,15 +373,16 @@ with st.sidebar:
                 for w in warnings: st.warning(w)
             
             if raw_list: update_db(pd.DataFrame(raw_list), RAW_DB_PATH, ['날짜', '단지명', '유형'])
-            update_db(pd.concat([parse_transactions(tx1).assign(단지명=name1) if tx1 else pd.DataFrame(), parse_transactions(tx2).assign(단지명=name2) if tx2 else pd.DataFrame()]), TX_DB_PATH, ['단지명', '날짜', '동', '타입', '금액_하한(억)', '층'])
+            
+            # ✨ [고유 1건 보장 중복제거 키 적용]
+            update_db(pd.concat([parse_transactions(tx1).assign(단지명=name1) if tx1 else pd.DataFrame(), parse_transactions(tx2).assign(단지명=name2) if tx2 else pd.DataFrame()]), TX_DB_PATH, ['단지명', '날짜', '층', '금액_하한(억)'])
             update_db(pd.concat([parse_naver_listings(ls1).assign(단지명=name1) if ls1 else pd.DataFrame(), parse_naver_listings(ls2).assign(단지명=name2) if ls2 else pd.DataFrame()]), LISTING_DB_PATH, ['단지명', '수집일', '동', '타입', '금액_하한(억)', '층'])
             update_db(pd.concat([parse_naver_rentals(rn1).assign(단지명=name1) if rn1 else pd.DataFrame(), parse_naver_rentals(rn2).assign(단지명=name2) if rn2 else pd.DataFrame()]), RENTAL_DB_PATH, ['단지명', '수집일', '동', '타입', '거래구분', '보증금(억)', '층'])
-            st.success("✨ 파싱 및 DB 저장 완료!")
+            st.success("✨ 파싱 및 정밀 DB 저장 완료!")
 
         st.markdown("---")
         st.subheader("🛠️ DB 데이터 수정 & 관리")
         
-        # ✨ [V28.2 신규] 데이터 롤백 및 삭제 도구
         c_del1, c_del2 = st.columns(2)
         with c_del1:
             if st.button("↺ 최근 스냅샷 롤백", help="가장 최근 입력한 날짜의 데이터를 전체 DB에서 삭제합니다."):
@@ -356,7 +419,7 @@ with st.sidebar:
 
 # --- 3. 메인 분석 대시보드 ---
 
-st.title(f"🏙️ {selected_complex} 정밀 라이프사이클 V28.2 Pro")
+st.title(f"🏙️ {selected_complex} 정밀 라이프사이클 V28.4 Pro")
 
 if os.path.exists(LISTING_DB_PATH):
     ls_df = pd.read_csv(LISTING_DB_PATH)
