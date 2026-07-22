@@ -8,7 +8,7 @@ from datetime import datetime
 import numpy as np
 
 # --- 페이지 기본 설정 ---
-st.set_page_config(page_title="프롭테크 하이퍼 엔진 V28 Pro", layout="wide", initial_sidebar_state="expanded")
+st.set_page_config(page_title="프롭테크 하이퍼 엔진 V28.1 Pro", layout="wide", initial_sidebar_state="expanded")
 
 # --- UI 스타일링 ---
 st.markdown("""
@@ -286,7 +286,7 @@ with st.sidebar:
 
 # --- 3. 메인 분석 대시보드 ---
 
-st.title(f"🏙️ {selected_complex} 정밀 라이프사이클 V28 Pro")
+st.title(f"🏙️ {selected_complex} 정밀 라이프사이클 V28.1 Pro")
 
 if os.path.exists(LISTING_DB_PATH):
     ls_df = pd.read_csv(LISTING_DB_PATH)
@@ -368,7 +368,7 @@ if os.path.exists(LISTING_DB_PATH):
             "📅 원문 히스토리"
         ])
 
-        # --- TAB 1: 실거래 매칭 ---
+        # --- TAB 1: 실거래 매칭 (✨ KeyError 예방 수정 완료) ---
         with tab1:
             st.markdown(f"### 🎯 [{selected_complex}] 최근 실거래가 및 매물 현황")
             c1, c2 = st.columns(2)
@@ -379,9 +379,10 @@ if os.path.exists(LISTING_DB_PATH):
                 else: st.info("실거래가 데이터가 없습니다.")
             with c2:
                 st.subheader("🏡 현재 최신 매매 호가")
-                st.dataframe(today_ls[['매물등록일', '동', '타입', '층', '방향', '금액_문자열', '중개사수']].sort_values('금액_하한(억)'), use_container_width=True)
+                # ✨ 먼저 sort_values 정렬 후 필요한 컬럼 추출
+                st.dataframe(today_ls.sort_values('금액_하한(억)')[['매물등록일', '동', '타입', '층', '방향', '금액_문자열', '중개사수']], use_container_width=True)
 
-        # --- TAB 2: 카톡 브리핑 엑스포트 (✨ 층수 중복 포맷팅 보완) ---
+        # --- TAB 2: 카톡 브리핑 엑스포트 ---
         with tab2:
             st.markdown("### 💬 모바일 카카오톡 맞춤 브리핑 리포터")
             
@@ -400,7 +401,6 @@ if os.path.exists(LISTING_DB_PATH):
             if not prev_df.empty and prev_dt != latest_dt:
                 today_keys = set(zip(today_ls['동'], today_ls['타입'], today_ls['층']))
                 
-                # target_tx 층 추출 사전 연산 (최적화)
                 if not target_tx.empty:
                     target_tx_temp = target_tx.copy()
                     target_tx_temp['p_floor_temp'] = target_tx_temp['층'].astype(str).str.extract(r'(\d+)')[0]
@@ -435,7 +435,6 @@ if os.path.exists(LISTING_DB_PATH):
             katalk_briefing += f"🗓️ 기준: {latest_dt.strftime('%m/%d')} ({weekday_str})\n"
             katalk_briefing += f"🏠 총 매물: {len(today_ls)}건{sold_info}\n\n"
 
-            # ✨ [보완] 층수 '층' 자 중복 부여 방지 함수
             def format_briefing_item(row, hide_dong=False, hide_type=False, hide_dir=False):
                 raw_floor = str(row['층']).split('/')[0] if '/' in str(row['층']) else str(row['층'])
                 floor_txt = raw_floor if str(raw_floor).endswith('층') else f"{raw_floor}층"
@@ -474,7 +473,7 @@ if os.path.exists(LISTING_DB_PATH):
                     for _, row in sub.iterrows(): katalk_briefing += f"{format_briefing_item(row, hide_dir=True)}\n"
                     katalk_briefing += "\n"
 
-            # 4) 컴팩트 요약 (✨ [보완] 층수 처리 반영)
+            # 4) 컴팩트 요약
             else:
                 katalk_briefing += "🔥 [타입별 최저가 매물 요약]\n"
                 type_mins = today_ls.groupby('타입')['금액_하한(억)'].idxmin()
@@ -497,7 +496,7 @@ if os.path.exists(LISTING_DB_PATH):
 
             st.text_area("📋 아래 텍스트 전체를 복사하여 카카오톡으로 발송하세요", value=katalk_briefing, height=450)
 
-        # --- TAB 3: 전월세 & 정밀 층수 통제 갭 트래킹 ---
+        # --- TAB 3: 전월세 & 정밀 층수 통제 갭 트래킹 (✨ KeyError 예방 수정 완료) ---
         with tab3:
             st.markdown(f"### 🔑 [{selected_complex}] 전월세 시세 & 층수그룹 정밀 갭(Gap) 분석")
             
@@ -538,8 +537,9 @@ if os.path.exists(LISTING_DB_PATH):
                 
                 st.markdown("---")
                 st.subheader("📋 전체 전월세 등록 매물 리스트")
+                # ✨ 먼저 sort_values 정렬 후 필요한 컬럼 추출
                 st.dataframe(
-                    today_rn[['매물등록일', '동', '거래구분', '타입', '층', '방향', '금액_문자열', '중개사수']].sort_values('보증금(억)', ascending=False),
+                    today_rn.sort_values('보증금(억)', ascending=False)[['매물등록일', '동', '거래구분', '타입', '층', '방향', '금액_문자열', '중개사수']],
                     use_container_width=True
                 )
             else:
@@ -560,7 +560,7 @@ if os.path.exists(LISTING_DB_PATH):
                 hide_index=True, use_container_width=True
             )
 
-        # --- TAB 5: 시각화 차트 (✨ [복원] 워터폴 차트 기능 포함) ---
+        # --- TAB 5: 시각화 차트 ---
         with tab5:
             st.markdown("### 📈 정밀 시각화 그래픽스 (시계열 밴드 / 히트맵 / 워터폴)")
             col_l, col_r = st.columns(2)
@@ -587,7 +587,7 @@ if os.path.exists(LISTING_DB_PATH):
                     st.plotly_chart(fig_hm, use_container_width=True)
                 else: st.info("히트맵 구성 데이터가 부족합니다.")
 
-            # ✨ [복원] 개별 매물 호가 인하 궤적 (Waterfall Chart)
+            # 개별 매물 호가 인하 궤적 (Waterfall Chart)
             st.markdown("---")
             st.subheader("📉 개별 매물 호가 인하 궤적 (Plotly Waterfall Chart)")
             cut_df = today_ls[today_ls['가격변동액(억)'] < 0].copy()
