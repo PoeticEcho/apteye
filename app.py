@@ -8,7 +8,7 @@ from datetime import datetime
 import numpy as np
 
 # --- 페이지 기본 설정 ---
-st.set_page_config(page_title="프롭테크 하이퍼 엔진 V28.1 Pro", layout="wide", initial_sidebar_state="expanded")
+st.set_page_config(page_title="프롭테크 하이퍼 엔진 V28.2 Pro", layout="wide", initial_sidebar_state="expanded")
 
 # --- UI 스타일링 ---
 st.markdown("""
@@ -84,7 +84,7 @@ def categorize_floor(floor_str):
     return '중층'
 
 def parse_transactions(text):
-    """통합 실거래가 파서"""
+    """통합 실거래가 파서 (면적 유효성 검증 로직 반영으로 '7.1' 같은 오파싱 방지)"""
     if not text.strip(): return pd.DataFrame()
     parsed = []
     
@@ -106,13 +106,18 @@ def parse_transactions(text):
         dong_bottom_m = re.search(r'\n(\d{3})\s*$', block.strip())
         
         if date_m and price_m and type_m:
+            area_val = float(type_m.group(1))
+            
+            # ✨ [유효성 검증] 면적이 10㎡ 미만이거나 300㎡ 초과인 오파싱 데이터 필터링 ('7.1' 방지)
+            if area_val < 10.0 or area_val > 300.0:
+                continue
+
             date_str = date_m.group(1)
             if len(date_str) == 5:
                 date_str = f"{current_year}.{date_str}"
             elif date_str.startswith('26.'):
                 date_str = '20' + date_str
             
-            area_val = float(type_m.group(1))
             area_base = f"{area_val:.2f}".rstrip('0').rstrip('.') if '.' in str(area_val) else str(int(area_val))
             
             pyeong_str = type_m.group(2) if type_m.group(2) else ""
@@ -234,13 +239,41 @@ def update_db(new_df, db_path, subset_keys):
         return True
     except: return False
 
+# ✨ [V28.2 신규] 단지 데이터 삭제 함수
+def delete_complex_data(complex_name):
+    """지정한 단지의 모든 데이터(매매, 전월세, 실거래, 원문)를 DB에서 완전 제거"""
+    paths_keys = [
+        (LISTING_DB_PATH, '단지명'),
+        (RENTAL_DB_PATH, '단지명'),
+        (TX_DB_PATH, '단지명'),
+        (RAW_DB_PATH, '단지명')
+    ]
+    for path, col in paths_keys:
+        if os.path.exists(path):
+            df = pd.read_csv(path)
+            if col in df.columns:
+                filtered_df = df[df[col] != complex_name]
+                filtered_df.to_csv(path, index=False, encoding='utf-8-sig')
+
+# ✨ [V28.2 신규] 최근 수집 스냅샷 롤백 함수
+def rollback_last_snapshot():
+    """가장 최근 날짜의 입력 데이터를 전체 DB에서 롤백(제거)"""
+    for path in [LISTING_DB_PATH, RENTAL_DB_PATH, TX_DB_PATH, RAW_DB_PATH]:
+        if os.path.exists(path):
+            df = pd.read_csv(path)
+            date_col = '수집일' if '수집일' in df.columns else ('날짜' if '날짜' in df.columns else None)
+            if date_col and not df.empty:
+                max_date = df[date_col].max()
+                df_filtered = df[df[date_col] != max_date]
+                df_filtered.to_csv(path, index=False, encoding='utf-8-sig')
+
 # --- 2. 사이드바 제어 센터 ---
 
 with st.sidebar:
     st.title("🏙️ 대시보드 제어")
     
-    with st.popover("📥 데이터 수집 & 원문 입력", use_container_width=True):
-        st.subheader("⚙️ 데이터 수집 센터")
+    with st.popover("⚙️ 데이터 수집 & DB 정제 관리", use_container_width=True):
+        st.subheader("📥 데이터 수집 센터")
         col_pop1, col_pop2 = st.columns(2)
         with col_pop1:
             name1 = st.text_input("단지 1 이름", value="범어자이(주상복합)", key="n1")
@@ -253,19 +286,56 @@ with st.sidebar:
             ls2 = st.text_area("단지 2 매매 호가 원문", height=80, key="l2")
             rn2 = st.text_area("단지 2 전월세 원문", height=80, key="r2")
 
+        # ✨ [V28.2 신규] 교차 검증 경고 및 저장 로직
         if st.button("💾 데이터 스냅샷 저장", use_container_width=True):
             today = datetime.now().strftime("%Y-%m-%d")
             raw_list = []
+            
+            # 교차 검증 메세지 저장용
+            warnings = []
+            
             for name, tx, ls, rn in [(name1, tx1, ls1, rn1), (name2, tx2, ls2, rn2)]:
+                combined_txt = tx + ls + rn
+                
+                # 교차 검증: 다른 아파트 주요 키워드가 포함되어 있는지 체크
+                if "범어자이" in name and ("오페라" in combined_txt or "고성동" in combined_txt):
+                    warnings.append(f"⚠️ [{name}] 입력 칸에 다른 단지(오페라W) 원문이 섞여 있는 것 같습니다.")
+                elif "오페라" in name and ("범어" in combined_txt or "수성구" in combined_txt):
+                    warnings.append(f"⚠️ [{name}] 입력 칸에 다른 단지(범어자이) 원문이 섞여 있는 것 같습니다.")
+
                 if tx.strip(): raw_list.append({'날짜': today, '단지명': name, '유형': '실거래', '원문': tx})
                 if ls.strip(): raw_list.append({'날짜': today, '단지명': name, '유형': '매매호가', '원문': ls})
                 if rn.strip(): raw_list.append({'날짜': today, '단지명': name, '유형': '전월세', '원문': rn})
+            
+            if warnings:
+                for w in warnings: st.warning(w)
             
             if raw_list: update_db(pd.DataFrame(raw_list), RAW_DB_PATH, ['날짜', '단지명', '유형'])
             update_db(pd.concat([parse_transactions(tx1).assign(단지명=name1) if tx1 else pd.DataFrame(), parse_transactions(tx2).assign(단지명=name2) if tx2 else pd.DataFrame()]), TX_DB_PATH, ['단지명', '날짜', '동', '타입', '금액_하한(억)', '층'])
             update_db(pd.concat([parse_naver_listings(ls1).assign(단지명=name1) if ls1 else pd.DataFrame(), parse_naver_listings(ls2).assign(단지명=name2) if ls2 else pd.DataFrame()]), LISTING_DB_PATH, ['단지명', '수집일', '동', '타입', '금액_하한(억)', '층'])
             update_db(pd.concat([parse_naver_rentals(rn1).assign(단지명=name1) if rn1 else pd.DataFrame(), parse_naver_rentals(rn2).assign(단지명=name2) if rn2 else pd.DataFrame()]), RENTAL_DB_PATH, ['단지명', '수집일', '동', '타입', '거래구분', '보증금(억)', '층'])
             st.success("✨ 파싱 및 DB 저장 완료!")
+
+        st.markdown("---")
+        st.subheader("🛠️ DB 데이터 수정 & 관리")
+        
+        # ✨ [V28.2 신규] 데이터 롤백 및 삭제 도구
+        c_del1, c_del2 = st.columns(2)
+        with c_del1:
+            if st.button("↺ 최근 스냅샷 롤백", help="가장 최근 입력한 날짜의 데이터를 전체 DB에서 삭제합니다."):
+                rollback_last_snapshot()
+                st.success("최근 입력 데이터가 롤백되었습니다!")
+                st.rerun()
+        with c_del2:
+            all_complexes = []
+            if os.path.exists(LISTING_DB_PATH):
+                all_complexes = list(pd.read_csv(LISTING_DB_PATH)['단지명'].unique())
+            del_target = st.selectbox("삭제할 단지 선택", all_complexes if all_complexes else ["없음"], key="del_tgt")
+            if st.button("🗑️ 선택 단지 DB 완전 삭제"):
+                if del_target != "없음":
+                    delete_complex_data(del_target)
+                    st.success(f"[{del_target}] 의 모든 데이터가 삭제되었습니다!")
+                    st.rerun()
 
     st.markdown("---")
     
@@ -286,7 +356,7 @@ with st.sidebar:
 
 # --- 3. 메인 분석 대시보드 ---
 
-st.title(f"🏙️ {selected_complex} 정밀 라이프사이클 V28.1 Pro")
+st.title(f"🏙️ {selected_complex} 정밀 라이프사이클 V28.2 Pro")
 
 if os.path.exists(LISTING_DB_PATH):
     ls_df = pd.read_csv(LISTING_DB_PATH)
@@ -305,7 +375,6 @@ if os.path.exists(LISTING_DB_PATH):
         today_ls['매물등록일_dt'] = pd.to_datetime(today_ls['매물등록일'], errors='coerce')
         today_ls['DOM(일)'] = (today_ls['수집일_dt'] - today_ls['매물등록일_dt']).dt.days.fillna(0).astype(int)
         
-        # 층수 그룹 할당 및 타입 그룹 세팅
         today_ls['층_구분'] = today_ls['층'].apply(categorize_floor)
         today_ls['타입_그룹'] = today_ls['타입'].astype(str).str.extract(r'(\d+)')[0]
         
@@ -328,11 +397,9 @@ if os.path.exists(LISTING_DB_PATH):
             target_tx['타입_그룹'] = target_tx['타입'].astype(str).str.extract(r'(\d+)')[0]
             target_tx['층_구분'] = target_tx['층'].apply(categorize_floor)
             
-            # 층수 그룹별 실거래 평균
             tx_floor_summary = target_tx.groupby(['타입_그룹', '층_구분'])['금액_하한(억)'].mean().reset_index()
             tx_floor_summary.rename(columns={'금액_하한(억)': '층별실거래평균(억)'}, inplace=True)
             
-            # 타입 전체 실거래 평균
             tx_type_summary = target_tx.groupby('타입_그룹')['금액_하한(억)'].mean().reset_index()
             tx_type_summary.rename(columns={'금액_하한(억)': '타입실거래평균(억)'}, inplace=True)
             
@@ -368,7 +435,7 @@ if os.path.exists(LISTING_DB_PATH):
             "📅 원문 히스토리"
         ])
 
-        # --- TAB 1: 실거래 매칭 (✨ KeyError 예방 수정 완료) ---
+        # --- TAB 1: 실거래 매칭 ---
         with tab1:
             st.markdown(f"### 🎯 [{selected_complex}] 최근 실거래가 및 매물 현황")
             c1, c2 = st.columns(2)
@@ -379,7 +446,6 @@ if os.path.exists(LISTING_DB_PATH):
                 else: st.info("실거래가 데이터가 없습니다.")
             with c2:
                 st.subheader("🏡 현재 최신 매매 호가")
-                # ✨ 먼저 sort_values 정렬 후 필요한 컬럼 추출
                 st.dataframe(today_ls.sort_values('금액_하한(억)')[['매물등록일', '동', '타입', '층', '방향', '금액_문자열', '중개사수']], use_container_width=True)
 
         # --- TAB 2: 카톡 브리핑 엑스포트 ---
@@ -396,7 +462,6 @@ if os.path.exists(LISTING_DB_PATH):
                 horizontal=True
             )
 
-            # 소진/체결 매물 감지
             sold_items = []
             if not prev_df.empty and prev_dt != latest_dt:
                 today_keys = set(zip(today_ls['동'], today_ls['타입'], today_ls['층']))
@@ -449,7 +514,6 @@ if os.path.exists(LISTING_DB_PATH):
                 
                 return "▪️ " + " / ".join(parts)
 
-            # 1) 기본: 동별 전체
             if group_option == "🏢 동별 (기본 - 전체)":
                 for dong in sorted(today_ls['동'].unique()):
                     sub = today_ls[today_ls['동'] == dong].sort_values('금액_하한(억)')
@@ -457,7 +521,6 @@ if os.path.exists(LISTING_DB_PATH):
                     for _, row in sub.iterrows(): katalk_briefing += f"{format_briefing_item(row, hide_dong=True)}\n"
                     katalk_briefing += "\n"
             
-            # 2) 타입별 전체
             elif group_option == "📐 타입별 (전체)":
                 for t_code in sorted(today_ls['타입'].unique()):
                     sub = today_ls[today_ls['타입'] == t_code].sort_values('금액_하한(억)')
@@ -465,7 +528,6 @@ if os.path.exists(LISTING_DB_PATH):
                     for _, row in sub.iterrows(): katalk_briefing += f"{format_briefing_item(row, hide_type=True)}\n"
                     katalk_briefing += "\n"
 
-            # 3) 방향별 전체
             elif group_option == "🧭 방향별 (전체)":
                 for direction in sorted(today_ls['방향'].unique()):
                     sub = today_ls[today_ls['방향'] == direction].sort_values('금액_하한(억)')
@@ -473,7 +535,6 @@ if os.path.exists(LISTING_DB_PATH):
                     for _, row in sub.iterrows(): katalk_briefing += f"{format_briefing_item(row, hide_dir=True)}\n"
                     katalk_briefing += "\n"
 
-            # 4) 컴팩트 요약
             else:
                 katalk_briefing += "🔥 [타입별 최저가 매물 요약]\n"
                 type_mins = today_ls.groupby('타입')['금액_하한(억)'].idxmin()
@@ -496,7 +557,7 @@ if os.path.exists(LISTING_DB_PATH):
 
             st.text_area("📋 아래 텍스트 전체를 복사하여 카카오톡으로 발송하세요", value=katalk_briefing, height=450)
 
-        # --- TAB 3: 전월세 & 정밀 층수 통제 갭 트래킹 (✨ KeyError 예방 수정 완료) ---
+        # --- TAB 3: 전월세 & 정밀 층수 통제 갭 트래킹 ---
         with tab3:
             st.markdown(f"### 🔑 [{selected_complex}] 전월세 시세 & 층수그룹 정밀 갭(Gap) 분석")
             
@@ -537,7 +598,6 @@ if os.path.exists(LISTING_DB_PATH):
                 
                 st.markdown("---")
                 st.subheader("📋 전체 전월세 등록 매물 리스트")
-                # ✨ 먼저 sort_values 정렬 후 필요한 컬럼 추출
                 st.dataframe(
                     today_rn.sort_values('보증금(억)', ascending=False)[['매물등록일', '동', '거래구분', '타입', '층', '방향', '금액_문자열', '중개사수']],
                     use_container_width=True
