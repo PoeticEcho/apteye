@@ -8,7 +8,7 @@ from datetime import datetime
 import numpy as np
 
 # --- 페이지 기본 설정 ---
-st.set_page_config(page_title="프롭테크 하이퍼 엔진 V28.15 Pro", layout="wide", initial_sidebar_state="expanded")
+st.set_page_config(page_title="프롭테크 하이퍼 엔진 V28.16 Pro", layout="wide", initial_sidebar_state="expanded")
 
 # --- UI 스타일링 ---
 st.markdown("""
@@ -36,19 +36,9 @@ if 'raw_text_2' not in st.session_state:
 # --- 1. 유니버설 파서 엔진 ---
 
 def convert_price_single(p_str):
-    """
-    ✨ [V28.15] 실거래가/호가 한글 원문 정밀 가격 파서
-    - '11억3' -> 11.0003 (11억 3만원)
-    - '11억3천3' -> 11.3003 (11억 3003만원)
-    - '11억303' -> 11.0303 (11억 303만원)
-    - '15억7천238' -> 15.7238 (15억 7238만원)
-    """
     if not p_str or pd.isna(p_str): return 0.0
     p_str = str(p_str).replace('(고)', '').replace(' ', '').replace(',', '').replace('\n', '').strip()
-    
-    uk = 0
-    man = 0
-    
+    uk, man = 0, 0
     if '억' in p_str:
         parts = p_str.split('억')
         uk_part = parts[0].strip()
@@ -64,11 +54,9 @@ def convert_price_single(p_str):
         man = (cheon_val * 1000) + tail_val
     elif rest.isdigit():
         man = int(rest)
-            
     return uk + (man / 10000.0)
 
 def process_price_columns(df):
-    """가격 컬럼 생성 및 전처리"""
     if df.empty or '금액_문자열' not in df.columns: return df
     def extract_ranges(val):
         val_str = str(val).replace('\n', '').strip()
@@ -85,7 +73,6 @@ def process_price_columns(df):
     return df
 
 def categorize_floor(floor_str):
-    """층수 정규화 (저층/중층/고층/탑층 범주화)"""
     f_str = str(floor_str).strip()
     if '탑' in f_str: return '탑층'
     elif '고' in f_str: return '고층'
@@ -104,16 +91,25 @@ def categorize_floor(floor_str):
     return '중층'
 
 def is_valid_date(y, m, d):
-    """날짜 유효성 검증"""
     try:
         m, d = int(m), int(d)
         return 1 <= m <= 12 and 1 <= d <= 31
     except:
         return False
 
+def preprocess_raw_text(text):
+    """
+    ✨ [V28.16 전처리기] 
+    복사 붙여넣기로 날짜와 면적 사이에 줄바꿈이 유실되어 '07.17114.9694'처럼 붙은 경우 강제 개행 삽입
+    """
+    if not text: return ""
+    # MM.DD 뒤에 바로 숫자가 붙는 경우 줄바꿈 삽입
+    text = re.sub(r'(\d{2}\.\d{2})(\d{2,3}\.\d+)', r'\1\n\2', text)
+    return text
+
 def parse_transactions(text):
-    """실거래가 파서"""
     if not text.strip(): return pd.DataFrame()
+    text = preprocess_raw_text(text)
     parsed = []
     
     lines = text.split('\n')
@@ -242,11 +238,11 @@ def parse_transactions(text):
     if df_res.empty: return df_res
     
     df_res = process_price_columns(df_res)
-    subset_cols = [c for c in ['날짜', '층', '금액_하한(억)'] if c in df_res.columns]
+    # ✨ [V28.16 핵심] 고유 지문 중복 차단 키 확장 (날짜, 타입, 층, 금액)
+    subset_cols = [c for c in ['날짜', '타입', '층', '금액_하한(억)'] if c in df_res.columns]
     return df_res.drop_duplicates(subset=subset_cols, keep='first')
 
 def parse_naver_listings(text):
-    """네이버 매매 매물 파서"""
     if not text.strip(): return pd.DataFrame()
     today_str = datetime.now().strftime("%Y-%m-%d")
     parsed = []
@@ -286,7 +282,6 @@ def parse_naver_listings(text):
     return pd.DataFrame(parsed)
 
 def parse_naver_rentals(text):
-    """네이버 전월세 매물 파서"""
     if not text.strip(): return pd.DataFrame()
     today_str = datetime.now().strftime("%Y-%m-%d")
     parsed = []
@@ -336,30 +331,22 @@ def parse_naver_rentals(text):
     return pd.DataFrame(parsed)
 
 def smart_auto_parse_and_update(raw_text, complex_name):
-    """
-    ✨ [V28.15 핵심 파서 & HUD 상태 반환]
-    저장 후 카운트 메트릭 반환
-    """
     if not raw_text.strip(): return 0, 0, 0
-    
     today = datetime.now().strftime("%Y-%m-%d")
     tx_cnt, ls_cnt, rn_cnt = 0, 0, 0
     
-    # 1. 실거래가 파싱
     df_tx = parse_transactions(raw_text)
     if not df_tx.empty:
         tx_cnt = len(df_tx)
-        update_db(df_tx.assign(단지명=complex_name), TX_DB_PATH, ['단지명', '날짜', '층', '금액_하한(억)'])
+        update_db(df_tx.assign(단지명=complex_name), TX_DB_PATH, ['단지명', '날짜', '타입', '층', '금액_하한(억)'])
         update_db(pd.DataFrame([{'날짜': today, '단지명': complex_name, '유형': '실거래', '원문': raw_text}]), RAW_DB_PATH, ['날짜', '단지명', '유형'])
         
-    # 2. 네이버 매매 파싱
     df_ls = parse_naver_listings(raw_text)
     if not df_ls.empty:
         ls_cnt = len(df_ls)
         update_db(df_ls.assign(단지명=complex_name), LISTING_DB_PATH, ['단지명', '수집일', '동', '타입', '금액_하한(억)', '층'])
         update_db(pd.DataFrame([{'날짜': today, '단지명': complex_name, '유형': '매매호가', '원문': raw_text}]), RAW_DB_PATH, ['날짜', '단지명', '유형'])
 
-    # 3. 네이버 전월세 파싱
     df_rn = parse_naver_rentals(raw_text)
     if not df_rn.empty:
         rn_cnt = len(df_rn)
@@ -427,7 +414,7 @@ with st.sidebar:
                     st.warning(f"⚠️ [{name1}] 입력 칸에 다른 단지 원문이 섞여 있는 것 같습니다.")
                 
                 tx_c, ls_c, rn_c = smart_auto_parse_and_update(raw1, name1)
-                st.session_state['raw_text_1'] = "" # 입력창 리셋
+                st.session_state['raw_text_1'] = ""
                 
                 total_c = tx_c + ls_c + rn_c
                 if total_c > 0:
@@ -448,7 +435,7 @@ with st.sidebar:
                     st.warning(f"⚠️ [{name2}] 입력 칸에 다른 단지 원문이 섞여 있는 것 같습니다.")
                 
                 tx_c, ls_c, rn_c = smart_auto_parse_and_update(raw2, name2)
-                st.session_state['raw_text_2'] = "" # 입력창 리셋
+                st.session_state['raw_text_2'] = ""
                 
                 total_c = tx_c + ls_c + rn_c
                 if total_c > 0:
@@ -504,7 +491,7 @@ with st.sidebar:
 
 # --- 3. 메인 분석 대시보드 ---
 
-st.title(f"🏙️ {selected_complex} 정밀 라이프사이클 V28.15 Pro")
+st.title(f"🏙️ {selected_complex} 정밀 라이프사이클 V28.16 Pro")
 
 ls_df = pd.read_csv(LISTING_DB_PATH) if os.path.exists(LISTING_DB_PATH) else pd.DataFrame()
 tx_df = pd.read_csv(TX_DB_PATH) if os.path.exists(TX_DB_PATH) else pd.DataFrame()
@@ -601,7 +588,7 @@ if has_data:
 
     # --- TAB 2: 카톡 브리핑 엑스포트 ---
     with tab2:
-        st.markdown("### 💬 모바일 카카오톡 맞춤 브리핑 리포터")
+        st.markdown(f"### 💬 모바일 카카오톡 맞춤 브리핑 리포터")
         if not today_ls.empty:
             latest_dt = today_ls['수집일_dt'].max()
             group_option = st.radio(
