@@ -8,7 +8,7 @@ from datetime import datetime
 import numpy as np
 
 # --- 페이지 기본 설정 ---
-st.set_page_config(page_title="프롭테크 하이퍼 엔진 V28.12 Pro", layout="wide", initial_sidebar_state="expanded")
+st.set_page_config(page_title="프롭테크 하이퍼 엔진 V28.13 Pro", layout="wide", initial_sidebar_state="expanded")
 
 # --- UI 스타일링 ---
 st.markdown("""
@@ -31,7 +31,7 @@ RAW_DB_PATH = 'raw_inputs_db.csv'
 
 def convert_price_single(p_str):
     """
-    ✨ [V28.12] 실거래가/호가 한글 원문 정밀 가격 파서
+    ✨ [V28.13] 실거래가/호가 한글 원문 정밀 가격 파서
     - '11억3' -> 11.0003 (11억 3만원)
     - '11억3천3' -> 11.3003 (11억 3003만원)
     - '11억303' -> 11.0303 (11억 303만원)
@@ -99,12 +99,41 @@ def categorize_floor(floor_str):
 
 def parse_transactions(text):
     """
-    ✨ [V28.12 고도화] 날짜와 면적이 붙은 문장('07.17114.9694㎡') 정밀 분리 파서
+    ✨ [V28.13 고도화] 모든 유형의 실거래가 자동 파서 (유형 1, 2, 3 통합 대응)
     """
     if not text.strip(): return pd.DataFrame()
     parsed = []
     
-    # --- 패턴 1: 당일/일별 신고형 파싱 ---
+    # --- 패턴 1: 네이버 실거래가 표 양식 ('6월 23일 분양권 27층 10억 7,014') ---
+    lines = text.split('\n')
+    curr_y = "2026"
+    for line in lines:
+        line_s = line.strip()
+        y_match = re.search(r'(202[0-9])년', line_s)
+        if y_match:
+            curr_y = y_match.group(1)
+
+        if "계약취소" in line_s or "해지" in line_s:
+            continue
+
+        tbl_m = re.search(r'(\d{1,2})월\s*(\d{1,2})일\s+.*?\b(\d+)층\s+.*?(?:직거래|최고|최저)?\s*([0-9]+억[0-9천\s,\.]*)', line_s)
+        if tbl_m:
+            mm = tbl_m.group(1).zfill(2)
+            dd = tbl_m.group(2).zfill(2)
+            fl = tbl_m.group(3)
+            pr = tbl_m.group(4)
+            dt_type = "직거래" if "직거래" in line_s else "중개거래"
+            parsed.append({
+                '날짜': f"{curr_y}.{mm}.{dd}",
+                '타입': "전체", 
+                '금액_문자열': pr,
+                '층': fl,
+                '동': "동미상",
+                '거래유형': dt_type,
+                '데이터구분': '실거래'
+            })
+
+    # --- 패턴 2: 당일/일별 신고형 파싱 ---
     b_blocks = re.split(r'(?=(?:[가-힣]+구|[가-힣]+동)\n|\n[가-힣0-9]+분양권|\n[가-힣0-9]+아파트)', text)
     for b_block in b_blocks:
         contract_matches = re.finditer(r'([0-9]+억[0-9천\s,\.]*|[\d,]+만)[\s\S]{1,150}?([\d\.]+)㎡\s*(\d+[A-Z]?평)?[\s\S]{1,50}?(\d+)층(?:\s*(?<!\d)(\d{1,4})동?)?[\s\S]{1,30}?(중개거래|직거래)?[\s\S]{1,30}?((?:20)?2[0-9]\.\d{2}\.\d{2})\s*계약', b_block)
@@ -138,18 +167,16 @@ def parse_transactions(text):
                     '데이터구분': '실거래'
                 })
 
-    # --- 패턴 2: 다년도 목록/이력형 파싱 (붙은 날짜 대응) ---
-    lines = [line.strip() for line in text.split('\n') if line.strip()]
+    # --- 패턴 3: 다년도 목록/이력형 파싱 ---
     current_year = "2026"
     i = 0
     while i < len(lines):
-        line = lines[i]
+        line = lines[i].strip()
         
         y_m = re.search(r'(202[0-9])년', line)
         if y_m:
             current_year = y_m.group(1)
             
-        # ✨ 날짜가 면적과 붙어있는 형태(^07.17114.9694m2) 감지
         date_m = re.match(r'^((?:20)?2[0-9]\.\d{2}\.\d{2}|\d{2}\.\d{2})', line)
         if date_m:
             date_raw = date_m.group(1)
@@ -163,7 +190,7 @@ def parse_transactions(text):
             block_lines = [line]
             j = i + 1
             while j < len(lines):
-                next_line = lines[j]
+                next_line = lines[j].strip()
                 if re.search(r'(202[0-9])년', next_line) or re.match(r'^((?:20)?2[0-9]\.\d{2}\.\d{2}|\d{2}\.\d{2})', next_line):
                     break
                 block_lines.append(next_line)
@@ -172,7 +199,7 @@ def parse_transactions(text):
             block_txt = "\n".join(block_lines)
             i = j
             
-            if "해지" in block_txt:
+            if "해지" in block_txt or "계약취소" in block_txt:
                 continue
                 
             price_m = re.search(r'([0-9]+억[0-9천\s,\.]*|[\d,]+만)(?:\(고\))?', block_txt)
@@ -301,6 +328,33 @@ def parse_naver_rentals(text):
             })
     return pd.DataFrame(parsed)
 
+def smart_auto_parse_and_update(raw_text, complex_name):
+    """
+    ✨ [V28.13 핵심 엔진]
+    단일 원문 텍스트를 자동 라우팅하여 매매/전월세/실거래가를 동시에 추출 및 DB 업데이트
+    """
+    if not raw_text.strip(): return
+    
+    today = datetime.now().strftime("%Y-%m-%d")
+    
+    # 1. 실거래가 파싱 시도
+    df_tx = parse_transactions(raw_text)
+    if not df_tx.empty:
+        update_db(df_tx.assign(단지명=complex_name), TX_DB_PATH, ['단지명', '날짜', '층', '금액_하한(억)'])
+        update_db(pd.DataFrame([{'날짜': today, '단지명': complex_name, '유형': '실거래', '원문': raw_text}]), RAW_DB_PATH, ['날짜', '단지명', '유형'])
+        
+    # 2. 네이버 매매 파싱 시도
+    df_ls = parse_naver_listings(raw_text)
+    if not df_ls.empty:
+        update_db(df_ls.assign(단지명=complex_name), LISTING_DB_PATH, ['단지명', '수집일', '동', '타입', '금액_하한(억)', '층'])
+        update_db(pd.DataFrame([{'날짜': today, '단지명': complex_name, '유형': '매매호가', '원문': raw_text}]), RAW_DB_PATH, ['날짜', '단지명', '유형'])
+
+    # 3. 네이버 전월세 파싱 시도
+    df_rn = parse_naver_rentals(raw_text)
+    if not df_rn.empty:
+        update_db(df_rn.assign(단지명=complex_name), RENTAL_DB_PATH, ['단지명', '수집일', '동', '타입', '거래구분', '보증금(억)', '층'])
+        update_db(pd.DataFrame([{'날짜': today, '단지명': complex_name, '유형': '전월세', '원문': raw_text}]), RAW_DB_PATH, ['날짜', '단지명', '유형'])
+
 def update_db(new_df, db_path, subset_keys):
     """DB 누적 및 중복 제거 업데이트"""
     if new_df.empty: return True
@@ -348,45 +402,33 @@ def rollback_last_snapshot():
 with st.sidebar:
     st.title("🏙️ 대시보드 제어")
     
-    with st.popover("⚙️ 데이터 수집 & DB 정제 관리", use_container_width=True):
-        st.subheader("📥 데이터 수집 센터")
+    with st.popover("⚙️ 스마트 데이터 입력 & DB 정제", use_container_width=True):
+        st.subheader("📥 스마트 통합 입력 센터")
+        st.caption("💡 매매, 전월세, 실거래가 구별 없이 아래 하나의 입력창에 원문을 몽땅 붙여넣으세요!")
+        
         col_pop1, col_pop2 = st.columns(2)
         with col_pop1:
             name1 = st.text_input("단지 1 이름", value="범어자이(주상복합)", key="n1")
-            tx1 = st.text_area("단지 1 실거래 원문", height=80, key="t1")
-            ls1 = st.text_area("단지 1 매매 호가 원문", height=80, key="l1")
-            rn1 = st.text_area("단지 1 전월세 원문", height=80, key="r1")
+            raw1 = st.text_area("단지 1 통합 원문 (모든 유형 한 번에 입력)", height=220, key="r1_unified", help="네이버 매매, 전월세, 실거래가 텍스트를 그냥 통째로 붙여넣으세요.")
         with col_pop2:
             name2 = st.text_input("단지 2 이름", value="대구역오페라더블유(주상복합)", key="n2")
-            tx2 = st.text_area("단지 2 실거래 원문", height=80, key="t2")
-            ls2 = st.text_area("단지 2 매매 호가 원문", height=80, key="l2")
-            rn2 = st.text_area("단지 2 전월세 원문", height=80, key="r2")
+            raw2 = st.text_area("단지 2 통합 원문 (모든 유형 한 번에 입력)", height=220, key="r2_unified", help="네이버 매매, 전월세, 실거래가 텍스트를 그냥 통째로 붙여넣으세요.")
 
-        if st.button("💾 데이터 스냅샷 저장", use_container_width=True):
-            today = datetime.now().strftime("%Y-%m-%d")
-            raw_list = []
+        if st.button("🚀 스마트 데이터 저장 (자동 구별 및 추출)", use_container_width=True):
             warnings = []
-            
-            for name, tx, ls, rn in [(name1, tx1, ls1, rn1), (name2, tx2, ls2, rn2)]:
-                combined_txt = tx + ls + rn
-                
-                if "범어자이" in name and ("오페라" in combined_txt or "고성동" in combined_txt):
-                    warnings.append(f"⚠️ [{name}] 입력 칸에 다른 단지(오페라W) 원문이 섞여 있는 것 같습니다.")
-                elif "오페라" in name and ("범어" in combined_txt or "수성구" in combined_txt):
-                    warnings.append(f"⚠️ [{name}] 입력 칸에 다른 단지(범어자이) 원문이 섞여 있는 것 같습니다.")
+            for name, raw in [(name1, raw1), (name2, raw2)]:
+                if raw.strip():
+                    if "범어자이" in name and ("오페라" in raw or "고성동" in raw):
+                        warnings.append(f"⚠️ [{name}] 입력 칸에 다른 단지(오페라W) 원문이 섞여 있는 것 같습니다.")
+                    elif "오페라" in name and ("범어" in raw or "수성구" in raw):
+                        warnings.append(f"⚠️ [{name}] 입력 칸에 다른 단지(범어자이) 원문이 섞여 있는 것 같습니다.")
 
-                if tx.strip(): raw_list.append({'날짜': today, '단지명': name, '유형': '실거래', '원문': tx})
-                if ls.strip(): raw_list.append({'날짜': today, '단지명': name, '유형': '매매호가', '원문': ls})
-                if rn.strip(): raw_list.append({'날짜': today, '단지명': name, '유형': '전월세', '원문': rn})
+                    smart_auto_parse_and_update(raw, name)
             
             if warnings:
                 for w in warnings: st.warning(w)
             
-            if raw_list: update_db(pd.DataFrame(raw_list), RAW_DB_PATH, ['날짜', '단지명', '유형'])
-            update_db(pd.concat([parse_transactions(tx1).assign(단지명=name1) if tx1 else pd.DataFrame(), parse_transactions(tx2).assign(단지명=name2) if tx2 else pd.DataFrame()]), TX_DB_PATH, ['단지명', '날짜', '층', '금액_하한(억)'])
-            update_db(pd.concat([parse_naver_listings(ls1).assign(단지명=name1) if ls1 else pd.DataFrame(), parse_naver_listings(ls2).assign(단지명=name2) if ls2 else pd.DataFrame()]), LISTING_DB_PATH, ['단지명', '수집일', '동', '타입', '금액_하한(억)', '층'])
-            update_db(pd.concat([parse_naver_rentals(rn1).assign(단지명=name1) if rn1 else pd.DataFrame(), parse_naver_rentals(rn2).assign(단지명=name2) if rn2 else pd.DataFrame()]), RENTAL_DB_PATH, ['단지명', '수집일', '동', '타입', '거래구분', '보증금(억)', '층'])
-            st.success("✨ 파싱 및 정밀 DB 저장 완료!")
+            st.success("✨ 스마트 파싱 및 정밀 DB 분류 저장 완료!")
 
         st.markdown("---")
         st.subheader("🛠️ DB 데이터 수정 & 관리")
@@ -399,9 +441,12 @@ with st.sidebar:
                 st.rerun()
         with c_del2:
             all_complexes = []
-            if os.path.exists(LISTING_DB_PATH):
-                all_complexes = list(pd.read_csv(LISTING_DB_PATH)['단지명'].unique())
-            del_target = st.selectbox("삭제할 단지 선택", all_complexes if all_complexes else ["없음"], key="del_tgt")
+            for p in [LISTING_DB_PATH, RENTAL_DB_PATH, TX_DB_PATH]:
+                if os.path.exists(p):
+                    all_complexes.extend(list(pd.read_csv(p)['단지명'].unique()))
+            unique_complexes = list(set(all_complexes))
+            
+            del_target = st.selectbox("삭제할 단지 선택", unique_complexes if unique_complexes else ["없음"], key="del_tgt")
             if st.button("🗑️ 선택 단지 DB 완전 삭제"):
                 if del_target != "없음":
                     delete_complex_data(del_target)
@@ -431,7 +476,7 @@ with st.sidebar:
 
 # --- 3. 메인 분석 대시보드 ---
 
-st.title(f"🏙️ {selected_complex} 정밀 라이프사이클 V28.12 Pro")
+st.title(f"🏙️ {selected_complex} 정밀 라이프사이클 V28.13 Pro")
 
 ls_df = pd.read_csv(LISTING_DB_PATH) if os.path.exists(LISTING_DB_PATH) else pd.DataFrame()
 tx_df = pd.read_csv(TX_DB_PATH) if os.path.exists(TX_DB_PATH) else pd.DataFrame()
@@ -642,7 +687,7 @@ if has_data:
                 use_container_width=True
             )
         else:
-            st.info("등록된 전월세 데이터가 없습니다. 사이드바의 [⚙️ 데이터 수집]에서 전월세 원문을 입력해 보세요.")
+            st.info("등록된 전월세 데이터가 없습니다. 사이드바의 [⚙️ 스마트 데이터 입력]에서 전월세 원문을 입력해 보세요.")
 
     # --- TAB 4: 괴리율 & 체류기간 ---
     with tab4:
@@ -756,4 +801,4 @@ if has_data:
                     raw_rn = target_raw[(target_raw['날짜']==search_date) & (target_raw['유형']=='전월세')]
                     st.text_area("RRN (전월세)", raw_rn['원문'].iloc[0] if not raw_rn.empty else "기록 없음", height=350)
 else:
-    st.info("📌 수집된 데이터가 없습니다. 좌측 사이드바 [⚙️ 데이터 수집 & DB 정제 관리] 팝오버를 눌러 원문 텍스트를 입력해 보세요.")
+    st.info("📌 수집된 데이터가 없습니다. 좌측 사이드바 [⚙️ 스마트 데이터 입력] 팝오버를 눌러 원문 텍스트를 입력해 보세요.")
