@@ -8,7 +8,7 @@ from datetime import datetime
 import numpy as np
 
 # --- 페이지 기본 설정 ---
-st.set_page_config(page_title="프롭테크 하이퍼 엔진 V28.9 Pro", layout="wide", initial_sidebar_state="expanded")
+st.set_page_config(page_title="프롭테크 하이퍼 엔진 V28.10 Pro", layout="wide", initial_sidebar_state="expanded")
 
 # --- UI 스타일링 ---
 st.markdown("""
@@ -31,8 +31,7 @@ RAW_DB_PATH = 'raw_inputs_db.csv'
 
 def convert_price_single(p_str):
     """
-    ✨ [V28.9 정밀 가격 파서]
-    실거래가/호가 한글 원문 규칙 완벽 반영:
+    ✨ [V28.10] 실거래가/호가 한글 원문 규칙 정밀 파서
     - '11억3' -> 11.0003 (11억 3만원)
     - '11억3천3' -> 11.3003 (11억 3003만원)
     - '11억303' -> 11.0303 (11억 303만원)
@@ -424,7 +423,7 @@ with st.sidebar:
 
 # --- 3. 메인 분석 대시보드 ---
 
-st.title(f"🏙️ {selected_complex} 정밀 라이프사이클 V28.9 Pro")
+st.title(f"🏙️ {selected_complex} 정밀 라이프사이클 V28.10 Pro")
 
 if os.path.exists(LISTING_DB_PATH):
     ls_df = pd.read_csv(LISTING_DB_PATH)
@@ -688,7 +687,7 @@ if os.path.exists(LISTING_DB_PATH):
                 hide_index=True, use_container_width=True
             )
 
-        # --- TAB 5: 시각화 차트 ---
+        # --- TAB 5: 시각화 차트 (✨ [UFuncTypeError 수정 완료]) ---
         with tab5:
             st.markdown("### 📈 정밀 시각화 그래픽스 (시계열 밴드 / 히트맵 / 워터폴)")
             col_l, col_r = st.columns(2)
@@ -701,13 +700,19 @@ if os.path.exists(LISTING_DB_PATH):
                 if not target_tx.empty:
                     tx_valid = target_tx.dropna(subset=['날짜', '금액_하한(억)']).sort_values('날짜')
                     if not tx_valid.empty:
+                        # ✨ 모든 변수를 명시적으로 .astype(str) 변환하여 타입 불일치 에러 방지
+                        hover_labels = (
+                            tx_valid['타입'].astype(str) + " / " + 
+                            tx_valid['층'].astype(str) + "층 / " + 
+                            tx_valid['금액_문자열'].astype(str)
+                        )
                         fig.add_trace(go.Scatter(
                             x=tx_valid['날짜'], 
                             y=tx_valid['금액_하한(억)'], 
                             mode='markers', 
                             name='실거래 체결점', 
                             marker=dict(size=10, color='purple', symbol='diamond'),
-                            hovertext=tx_valid['타입'] + " / " + tx_valid['층'] + "층 / " + tx_valid['금액_문자열']
+                            hovertext=hover_labels
                         ))
                         
                 fig.update_layout(title="시계열 호가 밴드 vs 실거래가", xaxis_title="날짜", yaxis_title="억 원", hovermode="x unified")
@@ -731,7 +736,7 @@ if os.path.exists(LISTING_DB_PATH):
             st.subheader("📉 개별 매물 호가 인하 궤적 (Plotly Waterfall Chart)")
             cut_df = today_ls[today_ls['가격변동액(억)'] < 0].copy()
             if not cut_df.empty:
-                cut_df['매물식별'] = cut_df['동'] + " / " + cut_df['타입'] + " / " + cut_df['층'].astype(str) + "층"
+                cut_df['매물식별'] = cut_df['동'].astype(str) + " / " + cut_df['타입'].astype(str) + " / " + cut_df['층'].astype(str) + "층"
                 selected_item = st.selectbox("호가 인하 매물 선택", cut_df['매물식별'].unique())
                 target_item = cut_df[cut_df['매물식별'] == selected_item].iloc[0]
                 first_p = target_item['최초호가(억)']
