@@ -8,7 +8,7 @@ from datetime import datetime
 import numpy as np
 
 # --- 페이지 기본 설정 ---
-st.set_page_config(page_title="프롭테크 하이퍼 엔진 V28.6 Pro", layout="wide", initial_sidebar_state="expanded")
+st.set_page_config(page_title="프롭테크 하이퍼 엔진 V28.9 Pro", layout="wide", initial_sidebar_state="expanded")
 
 # --- UI 스타일링 ---
 st.markdown("""
@@ -30,22 +30,37 @@ RAW_DB_PATH = 'raw_inputs_db.csv'
 # --- 1. 유니버설 파서 엔진 ---
 
 def convert_price_single(p_str):
-    """문자열 가격을 실수형(억 단위)으로 변환"""
-    p_str = str(p_str).replace('(고)', '').replace(' ', '').replace(',', '').replace('\n', '')
-    uk, man = 0, 0
+    """
+    ✨ [V28.9 정밀 가격 파서]
+    실거래가/호가 한글 원문 규칙 완벽 반영:
+    - '11억3' -> 11.0003 (11억 3만원)
+    - '11억3천3' -> 11.3003 (11억 3003만원)
+    - '11억303' -> 11.0303 (11억 303만원)
+    - '15억7천238' -> 15.7238 (15억 7238만원)
+    """
+    if not p_str or pd.isna(p_str): return 0.0
+    p_str = str(p_str).replace('(고)', '').replace(' ', '').replace(',', '').replace('\n', '').strip()
+    
+    uk = 0
+    man = 0
+    
     if '억' in p_str:
         parts = p_str.split('억')
-        uk = int(parts[0]) if parts[0].isdigit() else 0
-        rest = parts[1] if len(parts) > 1 else ""
+        uk_part = parts[0].strip()
+        uk = int(uk_part) if uk_part.isdigit() else 0
+        rest = parts[1].strip() if len(parts) > 1 else ""
     else:
         rest = p_str
+        
     if '천' in rest:
         c_parts = rest.split('천')
-        man += int(c_parts[0]) * 1000 if c_parts[0].isdigit() else 0
-        if len(c_parts) > 1 and c_parts[1].isdigit(): man += int(c_parts[1])
+        cheon_val = int(c_parts[0]) if c_parts[0].isdigit() else 0
+        tail_val = int(c_parts[1]) if (len(c_parts) > 1 and c_parts[1].isdigit()) else 0
+        man = (cheon_val * 1000) + tail_val
     elif rest.isdigit():
-        man += int(rest)
-    return uk + (man / 10000)
+        man = int(rest)
+            
+    return uk + (man / 10000.0)
 
 def process_price_columns(df):
     """가격 컬럼 생성 및 전처리"""
@@ -129,11 +144,9 @@ def parse_transactions(text):
     while i < len(lines):
         line = lines[i]
         
-        y_m = re.match(r'^(202[0-9])년?$', line)
+        y_m = re.search(r'(202[0-9])년', line)
         if y_m:
             current_year = y_m.group(1)
-            i += 1
-            continue
             
         date_m = re.match(r'^((?:20)?2[0-9]\.\d{2}\.\d{2}|\d{2}\.\d{2})$', line)
         if date_m:
@@ -149,7 +162,7 @@ def parse_transactions(text):
             j = i + 1
             while j < len(lines):
                 next_line = lines[j]
-                if re.match(r'^(202[0-9])년?$', next_line) or re.match(r'^((?:20)?2[0-9]\.\d{2}\.\d{2}|\d{2}\.\d{2})$', next_line):
+                if re.search(r'(202[0-9])년', next_line) or re.match(r'^((?:20)?2[0-9]\.\d{2}\.\d{2}|\d{2}\.\d{2})$', next_line):
                     break
                 block_lines.append(next_line)
                 j += 1
@@ -168,26 +181,24 @@ def parse_transactions(text):
             
             if price_m and type_m:
                 area_val = float(type_m.group(1))
-                if area_val < 10.0 or area_val > 300.0:
-                    continue
+                if 10.0 <= area_val <= 300.0:
+                    area_base = f"{area_val:.2f}".rstrip('0').rstrip('.') if '.' in str(area_val) else str(int(area_val))
+                    pyeong_str = type_m.group(2) if type_m.group(2) else ""
+                    alpha_m = re.search(r'([A-Z])평', pyeong_str)
+                    if alpha_m and not area_base.endswith(alpha_m.group(1)):
+                        area_base += alpha_m.group(1)
+                        
+                    dong_str = f"{floor_m.group(2)}동" if floor_m and floor_m.group(2) else ("동미상" if not dong_bottom_m else f"{dong_bottom_m.group(1)}동")
                     
-                area_base = f"{area_val:.2f}".rstrip('0').rstrip('.') if '.' in str(area_val) else str(int(area_val))
-                pyeong_str = type_m.group(2) if type_m.group(2) else ""
-                alpha_m = re.search(r'([A-Z])평', pyeong_str)
-                if alpha_m and not area_base.endswith(alpha_m.group(1)):
-                    area_base += alpha_m.group(1)
-                    
-                dong_str = f"{floor_m.group(2)}동" if floor_m and floor_m.group(2) else ("동미상" if not dong_bottom_m else f"{dong_bottom_m.group(1)}동")
-                
-                parsed.append({
-                    '날짜': full_date, 
-                    '타입': area_base, 
-                    '금액_문자열': price_m.group(1).strip(),
-                    '층': floor_m.group(1) if floor_m else "0", 
-                    '동': dong_str,
-                    '거래유형': deal_type_m.group(1) if deal_type_m else "중개거래", 
-                    '데이터구분': '실거래'
-                })
+                    parsed.append({
+                        '날짜': full_date, 
+                        '타입': area_base, 
+                        '금액_문자열': price_m.group(1).strip(),
+                        '층': floor_m.group(1) if floor_m else "0", 
+                        '동': dong_str,
+                        '거래유형': deal_type_m.group(1) if deal_type_m else "중개거래", 
+                        '데이터구분': '실거래'
+                    })
         else:
             i += 1
 
@@ -199,20 +210,15 @@ def parse_transactions(text):
     return df_res.drop_duplicates(subset=subset_cols, keep='first')
 
 def parse_naver_listings(text):
-    """
-    ✨ [V28.6 보완] 네이버 매매 매물 파서
-    - (?<!\d) 적용으로 104동이 4동으로 잘리는 현상 방지
-    """
+    """네이버 매매 매물 파서"""
     if not text.strip(): return pd.DataFrame()
     today_str = datetime.now().strftime("%Y-%m-%d")
     parsed = []
     
-    # ✨ 부정 후방 탐색 (?<!\d) 추가로 동 번호 앞부분 숫자가 잘리는 현상 차단
     blocks = re.split(r'(?=(?:[가-힣0-9()]+\s+)?(?<!\d)\d+동\s*\n?\s*매매)', text)
     for block in blocks:
         if "매매" not in block: continue
         
-        # ✨ 동 추출 시에도 (?<!\d) 추가
         dong_m = re.search(r'(?<!\d)(\d+동)', block)
         price_m = re.search(r'매매\s+([0-9억,\s~]+)', block)
         type_m = re.search(r'전용\s*([\d\.]+[A-Z]*)', block)
@@ -244,10 +250,7 @@ def parse_naver_listings(text):
     return pd.DataFrame(parsed)
 
 def parse_naver_rentals(text):
-    """
-    ✨ [V28.6 보완] 네이버 전월세 매물 파서
-    - (?<!\d) 적용으로 백 단위 동 번호 보존
-    """
+    """네이버 전월세 매물 파서"""
     if not text.strip(): return pd.DataFrame()
     today_str = datetime.now().strftime("%Y-%m-%d")
     parsed = []
@@ -258,7 +261,7 @@ def parse_naver_rentals(text):
         
         dong_m = re.search(r'(?<!\d)(\d+동)', block)
         deal_kind = "전세" if "전세" in block else "월세"
-        price_m = re.search(r'(?:전세|월세)\s+([0-9억,\s~/]+)', block)
+        price_m = re.search(r'(?:전세|월세)\s+([0-9억,\s~/~\-]+)', block)
         type_m = re.search(r'전용\s*([\d\.]+[A-Z]*)', block)
         
         floor_dir_m = re.search(r'([가-힣0-9]+)/\d+층\s*\n?\s*((?:남서|남동|북서|북동|남|북|동|서)향)?', block)
@@ -271,10 +274,13 @@ def parse_naver_rentals(text):
         if price_m and date_m:
             p_raw = price_m.group(1).strip()
             deposit = 0.0
+            
+            p_target = p_raw.split('~')[0].strip() if '~' in p_raw else p_raw
+            
             if deal_kind == "전세":
-                deposit = convert_price_single(p_raw)
+                deposit = convert_price_single(p_target)
             else:
-                dep_part = p_raw.split('/')[0] if '/' in p_raw else p_raw
+                dep_part = p_target.split('/')[0] if '/' in p_target else p_target
                 deposit = convert_price_single(dep_part)
 
             parsed.append({
@@ -418,7 +424,7 @@ with st.sidebar:
 
 # --- 3. 메인 분석 대시보드 ---
 
-st.title(f"🏙️ {selected_complex} 정밀 라이프사이클 V28.6 Pro")
+st.title(f"🏙️ {selected_complex} 정밀 라이프사이클 V28.9 Pro")
 
 if os.path.exists(LISTING_DB_PATH):
     ls_df = pd.read_csv(LISTING_DB_PATH)
@@ -691,8 +697,19 @@ if os.path.exists(LISTING_DB_PATH):
                 ls_daily = target_ls.groupby('수집일')['금액_하한(억)'].agg(['min', 'mean', 'max']).reset_index()
                 fig.add_trace(go.Scatter(x=ls_daily['수집일'], y=ls_daily['min'], name='최저 호가', line=dict(color='#10B981', width=3)))
                 fig.add_trace(go.Scatter(x=ls_daily['수집일'], y=ls_daily['max'], name='최고 호가', line=dict(color='#EF4444', dash='dot')))
+                
                 if not target_tx.empty:
-                    fig.add_trace(go.Scatter(x=target_tx['날짜'], y=target_tx['금액_하한(억)'], mode='markers', name='실거래 체결점', marker=dict(size=10, color='purple', symbol='diamond')))
+                    tx_valid = target_tx.dropna(subset=['날짜', '금액_하한(억)']).sort_values('날짜')
+                    if not tx_valid.empty:
+                        fig.add_trace(go.Scatter(
+                            x=tx_valid['날짜'], 
+                            y=tx_valid['금액_하한(억)'], 
+                            mode='markers', 
+                            name='실거래 체결점', 
+                            marker=dict(size=10, color='purple', symbol='diamond'),
+                            hovertext=tx_valid['타입'] + " / " + tx_valid['층'] + "층 / " + tx_valid['금액_문자열']
+                        ))
+                        
                 fig.update_layout(title="시계열 호가 밴드 vs 실거래가", xaxis_title="날짜", yaxis_title="억 원", hovermode="x unified")
                 st.plotly_chart(fig, use_container_width=True)
 
