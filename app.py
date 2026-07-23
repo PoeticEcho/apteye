@@ -310,7 +310,7 @@ st.markdown(
     unsafe_allow_html=True,
 )
 
-APP_VERSION = "29.3"
+APP_VERSION = "29.4"
 SUPABASE_TABLE = "real_estate_records"
 DEFAULT_SUPABASE_URL = "https://lyxfwtwqwlujxszezkud.supabase.co"
 
@@ -1580,17 +1580,39 @@ def mark_raw_changed() -> None:
     st.session_state[ingest_key("auto_parse_pending")] = True
 
 
+def normalize_ingest_text(raw_text: str) -> str:
+    """판독과 화면 비교에 동일하게 사용하는 원문 정규화."""
+    return str(raw_text or "").replace("\r\n", "\n").replace("\r", "\n").strip()
+
+
+def ingest_text_hash(raw_text: str) -> str:
+    normalized = normalize_ingest_text(raw_text)
+    return hashlib.sha256(normalized.encode("utf-8")).hexdigest() if normalized else ""
+
+
 def run_screening(raw_text: str, complex_name: str) -> None:
-    text = (raw_text or "").strip()
+    text = normalize_ingest_text(raw_text)
     if not text:
         reset_preview(clear_text=False)
         return
 
-    tx_df, sale_df, rental_df, report = parse_all_real_estate_text(
-        text,
-        expected_complex=complex_name or None,
-    )
-    text_hash = hashlib.sha256(text.encode("utf-8")).hexdigest()
+    try:
+        tx_df, sale_df, rental_df, report = parse_all_real_estate_text(
+            text,
+            expected_complex=complex_name or None,
+        )
+    except Exception as exc:
+        st.session_state[ingest_key("preview_hash")] = ingest_text_hash(text)
+        st.session_state[ingest_key("preview_tx")] = pd.DataFrame()
+        st.session_state[ingest_key("preview_sale")] = pd.DataFrame()
+        st.session_state[ingest_key("preview_rental")] = pd.DataFrame()
+        st.session_state[ingest_key("preview_report")] = {
+            "unparsed": True,
+            "parser_error": str(exc),
+        }
+        return
+
+    text_hash = ingest_text_hash(text)
 
     st.session_state[ingest_key("preview_hash")] = text_hash
     st.session_state[ingest_key("preview_tx")] = tx_df
@@ -1794,15 +1816,11 @@ remember_device_days = 180""",
             st.rerun()
 
     if analyze_clicked and not auto_processed:
-        with st.spinner("매매·전월세·실거래 형식을 한 번만 분석하고 있습니다…"):
+        with st.spinner("매매·전월세·실거래 형식을 분석하고 있습니다…"):
             run_screening(raw_text, complex_name)
 
     preview_hash = st.session_state.get(ingest_key("preview_hash"), "")
-    current_hash = (
-        hashlib.sha256(raw_text.encode("utf-8")).hexdigest()
-        if raw_text.strip()
-        else ""
-    )
+    current_hash = ingest_text_hash(raw_text)
 
     if not preview_hash or preview_hash != current_hash:
         st.info(
@@ -1816,6 +1834,10 @@ remember_device_days = 180""",
     rental_df = st.session_state[ingest_key("preview_rental")]
     report = st.session_state[ingest_key("preview_report")]
     detected = detected_categories()
+
+    parser_error = str(report.get("parser_error") or "").strip()
+    if parser_error:
+        st.error(f"파서 실행 중 오류가 발생했습니다: {parser_error}")
 
     st.markdown(
         f"""
