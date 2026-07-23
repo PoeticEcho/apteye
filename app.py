@@ -310,7 +310,7 @@ st.markdown(
     unsafe_allow_html=True,
 )
 
-APP_VERSION = "29.7"
+APP_VERSION = "29.8"
 SUPABASE_TABLE = "real_estate_records"
 DEFAULT_SUPABASE_URL = "https://lyxfwtwqwlujxszezkud.supabase.co"
 
@@ -1052,9 +1052,12 @@ GENERAL_AMOUNT_PATTERN = (
 
 LISTING_HEADER_RE = re.compile(
     r"(?m)^(?P<complex>[^\n]{1,100}?)\s+"
-    r"(?P<dong>\d{1,4}동)\s*\n\s*"
-    r"(?P<deal>매매|전세|월세)\s+"
-    r"(?P<price>[^\n]+)"
+    r"(?P<dong>\d{1,4}동)\s*$"
+)
+
+LISTING_DEAL_LINE_RE = re.compile(
+    r"(?m)^\s*(?P<deal>매매|전세|월세)\s*"
+    r"(?P<price>[^\n]+?)\s*$"
 )
 
 
@@ -1239,66 +1242,162 @@ def find_broker_name(block: str) -> str:
     return ""
 
 
+def find_primary_listing_deal(
+    block: str,
+) -> Optional[re.Match]:
+    """
+    한 매물 카드에서 대표 거래조건을 찾습니다.
+
+    네이버의 `매물목록 펼치기/접기` 아래에는 동일 가격이
+    중개사별로 여러 번 반복됩니다. 동 헤더 바로 뒤에서 처음 나오는
+    `매매/전세/월세 + 금액`만 대표 거래조건으로 사용합니다.
+    """
+    return LISTING_DEAL_LINE_RE.search(block)
+
+
 def parse_naver_property_cards(
     text: str,
     expected_complex: Optional[str] = None,
 ) -> Tuple[pd.DataFrame, Dict]:
     """
-    Parse sale, jeonse, and monthly-rent cards in one pass.
-    The page may contain more than one section and may be pasted together.
+    네이버 매매·전세·월세 매물 카드를 한 번에 파싱합니다.
+
+    판정 규칙
+    1. `단지명 + 102동` 같은 동 헤더를 카드 시작점으로 사용
+    2. 카드 안 첫 `매매/전세/월세 + 금액`으로 거래유형 판정
+    3. 그 다음 전용면적·층·방향·등록일을 대표 매물 정보로 사용
+    4. 펼쳐진 중개사별 동일 가격 반복행은 중복 저장하지 않음
     """
     text = normalize_raw_text(text)
-    matches = list(LISTING_HEADER_RE.finditer(text))
+    headers = list(LISTING_HEADER_RE.finditer(text))
+
     records: List[Dict] = []
     foreign_complexes = set()
     rejected = 0
+    expanded_rows_ignored = 0
     today_str = datetime.now().strftime("%Y-%m-%d")
 
-    for index, match in enumerate(matches):
-        block_end = matches[index + 1].start() if index + 1 < len(matches) else len(text)
-        block = text[match.start():block_end]
+    for index, header in enumerate(headers):
+        block_end = (
+            headers[index + 1].start()
+            if index + 1 < len(headers)
+            else len(text)
+        )
+        block = text[header.end():block_end]
 
-        found_complex = match.group("complex").strip()
-        if not is_same_complex(found_complex, expected_complex):
+        found_complex = header.group("complex").strip()
+
+        if not is_same_complex(
+            found_complex,
+            expected_complex,
+        ):
             foreign_complexes.add(found_complex)
             continue
 
-        deal = match.group("deal")
-        price_raw = extract_listing_price(deal, match.group("price"))
+        primary_deal = find_primary_listing_deal(block)
+
+        if not primary_deal:
+            rejected += 1
+            continue
+
+        deal = primary_deal.group("deal")
+        price_raw = extract_listing_price(
+            deal,
+            primary_deal.group("price"),
+        )
+
         if not price_raw:
             rejected += 1
             continue
 
-        area_match = re.search(
-            r"전용\s*(?P<area>\d+(?:\.\d+)?)(?P<suffix>[A-Za-z]?)",
-            block,
+        # 대표 거래행 외에 반복된 가격행은 중개사별 상세 중복입니다.
+        all_deal_lines = list(
+            LISTING_DEAL_LINE_RE.finditer(block)
         )
+        expanded_rows_ignored += max(
+            0,
+            len(all_deal_lines) - 1,
+        )
+
+        # 대표 거래행부터 첫 등록일까지를 매물 요약 영역으로 사용합니다.
+        date_after_primary = re.search(
+            r"(?:집주인확인매물|확인매물|등록)\s*"
+            r"20\d{2}\.\d{2}\.\d{2}",
+            block[primary_deal.end():],
+        )
+
+        if date_after_primary:
+            summary_end = (
+                primary_deal.end()
+                + date_after_primary.end()
+            )
+        else:
+            summary_end = min(
+                len(block),
+                primary_deal.end() + 800,
+            )
+
+        summary_block = block[
+            primary_deal.start():summary_end
+        ]
+
+        area_match = re.search(
+            r"전용\s*(?P<area>\d+(?:\.\d+)?)"
+            r"(?P<suffix>[A-Za-z]?)",
+            summary_block,
+        )
+
         floor_match = re.search(
             r"\)\s*(?P<floor>저|중|고|탑|\d{1,2})/"
             r"(?P<total>\d{1,2})층\s*"
             r"(?P<direction>남서|남동|북서|북동|남|북|동|서)향",
-            block,
+            summary_block,
         )
+
         if not floor_match:
             floor_match = re.search(
                 r"(?P<floor>저|중|고|탑|\d{1,2})/"
                 r"(?P<total>\d{1,2})층\s*"
                 r"(?P<direction>남서|남동|북서|북동|남|북|동|서)향",
-                block,
+                summary_block,
             )
 
         date_match = re.search(
             r"(?:집주인확인매물|확인매물|등록)\s*"
             r"(?P<date>20\d{2}\.\d{2}\.\d{2})",
-            block,
+            block[primary_deal.end():],
         )
-        broker_count_match = re.search(r"중개사\s*(\d+)곳", block)
 
-        area = area_match.group("area") if area_match else None
-        suffix = area_match.group("suffix").upper() if area_match else ""
-        floor = floor_match.group("floor") if floor_match else "미상"
-        total_floor = floor_match.group("total") if floor_match else ""
-        floor_value = f"{floor}/{total_floor}" if total_floor else floor
+        broker_count_match = re.search(
+            r"중개사\s*(\d+)곳",
+            block[primary_deal.end():],
+        )
+
+        area = (
+            area_match.group("area")
+            if area_match
+            else None
+        )
+        suffix = (
+            area_match.group("suffix").upper()
+            if area_match
+            else ""
+        )
+        floor = (
+            floor_match.group("floor")
+            if floor_match
+            else "미상"
+        )
+        total_floor = (
+            floor_match.group("total")
+            if floor_match
+            else ""
+        )
+        floor_value = (
+            f"{floor}/{total_floor}"
+            if total_floor
+            else floor
+        )
         direction = (
             f"{floor_match.group('direction')}향"
             if floor_match
@@ -1307,19 +1406,47 @@ def parse_naver_property_cards(
 
         base = {
             "수집일": today_str,
-            "매물등록일": date_match.group("date") if date_match else today_str.replace("-", "."),
+            "매물등록일": (
+                date_match.group("date")
+                if date_match
+                else today_str.replace("-", ".")
+            ),
             "원문단지명": found_complex,
-            "동": match.group("dong"),
+            "동": header.group("dong"),
             "타입": normalize_type(area, suffix),
-            "전용면적(㎡)": float(area) if area else pd.NA,
+            "전용면적(㎡)": (
+                float(area)
+                if area
+                else pd.NA
+            ),
             "층": floor_value,
-            "총층": int(total_floor) if total_floor else pd.NA,
+            "총층": (
+                int(total_floor)
+                if total_floor
+                else pd.NA
+            ),
             "방향": direction,
-            "중개사수": int(broker_count_match.group(1)) if broker_count_match else 1,
-            "중개사명": find_broker_name(block),
+            "중개사수": (
+                int(broker_count_match.group(1))
+                if broker_count_match
+                else 1
+            ),
+            # 중개사 N곳으로 묶인 대표 카드면 특정 중개사명을 쓰지 않습니다.
+            "중개사명": (
+                ""
+                if broker_count_match
+                else find_broker_name(block)
+            ),
             "금액_문자열": price_raw,
             "파서형식": "네이버매물카드",
-            "파싱신뢰도": 1.0 if area_match and floor_match and date_match else 0.8,
+            "파싱신뢰도": (
+                1.0
+                if area_match
+                and floor_match
+                and date_match
+                else 0.8
+            ),
+            "대표거래조건출처": "동헤더_첫거래행",
         }
 
         if deal == "매매":
@@ -1330,7 +1457,9 @@ def parse_naver_property_cards(
             records.append(base)
 
         elif deal == "전세":
-            low, high, avg = extract_price_range(price_raw)
+            low, high, avg = extract_price_range(
+                price_raw
+            )
             base.update({
                 "거래구분": "전세",
                 "보증금(억)": low,
@@ -1343,7 +1472,9 @@ def parse_naver_property_cards(
             records.append(base)
 
         else:
-            base.update(parse_monthly_price(price_raw))
+            base.update(
+                parse_monthly_price(price_raw)
+            )
             base.update({
                 "거래구분": "월세",
                 "데이터구분": "네이버매물(전월세)",
@@ -1351,11 +1482,31 @@ def parse_naver_property_cards(
             records.append(base)
 
     df = pd.DataFrame(records)
+
+    if not df.empty:
+        df = df.drop_duplicates(
+            subset=[
+                "원문단지명",
+                "동",
+                "거래구분",
+                "타입",
+                "층",
+                "금액_문자열",
+            ],
+            keep="first",
+        ).reset_index(drop=True)
+
     report = {
-        "listing_card_candidates": len(matches),
+        "listing_card_candidates": len(headers),
         "listing_card_rejected": rejected,
-        "foreign_complexes": sorted(foreign_complexes),
+        "listing_expanded_rows_ignored": (
+            expanded_rows_ignored
+        ),
+        "foreign_complexes": sorted(
+            foreign_complexes
+        ),
     }
+
     return df, report
 
 
@@ -2276,6 +2427,19 @@ remember_device_days = 180""",
         st.warning("다른 단지로 판단되어 제외: " + ", ".join(map(str, foreign)))
     if rejected:
         st.warning(f"필수 항목 부족으로 제외된 매물 후보: {rejected}건")
+
+    ignored_expanded = int(
+        report.get(
+            "listing_expanded_rows_ignored",
+            0,
+        ) or 0
+    )
+
+    if ignored_expanded:
+        st.info(
+            "네이버의 펼쳐진 중개사별 동일 가격 행 "
+            f"{ignored_expanded}개는 대표 매물의 중복 등록으로 판단해 제외했습니다."
+        )
 
     if report.get("naver_table_without_complex"):
         st.info(
