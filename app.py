@@ -310,7 +310,7 @@ st.markdown(
     unsafe_allow_html=True,
 )
 
-APP_VERSION = "29.5"
+APP_VERSION = "29.7"
 SUPABASE_TABLE = "real_estate_records"
 DEFAULT_SUPABASE_URL = "https://lyxfwtwqwlujxszezkud.supabase.co"
 
@@ -759,16 +759,36 @@ def clear_data_caches() -> None:
 
 def apt2_transaction_identity(
     payload: dict,
-) -> Optional[Tuple[str, str, str, str]]:
-    """아파트미 당일 신고 레코드의 수정 교체용 식별자."""
-    if str(payload.get("파서형식") or "") != "실거래_아파트미요약":
+) -> Optional[
+    Tuple[str, str, str, str, str]
+]:
+    """아파트미 요약형·거래이력형 수정 교체용 식별자."""
+    parser_format = str(
+        payload.get("파서형식") or ""
+    )
+
+    if parser_format not in {
+        "실거래_아파트미요약",
+        "실거래_아파트미이력",
+    }:
         return None
 
     return (
-        str(payload.get("날짜") or "").strip(),
-        str(payload.get("타입") or "").strip(),
-        str(payload.get("층") or "").strip(),
-        str(payload.get("거래유형") or "").strip(),
+        str(
+            payload.get("날짜") or ""
+        ).strip(),
+        str(
+            payload.get("타입") or ""
+        ).strip(),
+        str(
+            payload.get("층") or ""
+        ).strip(),
+        str(
+            payload.get("거래유형") or ""
+        ).strip(),
+        str(
+            payload.get("권리유형") or ""
+        ).strip(),
     )
 
 
@@ -782,7 +802,7 @@ def remove_stale_apt2_transactions(
     현재 수정본과 해시가 다른 행을 삭제합니다.
     """
     incoming_by_identity: Dict[
-        Tuple[str, str, str, str],
+        Tuple[str, str, str, str, str],
         str,
     ] = {}
 
@@ -1340,52 +1360,81 @@ def parse_naver_property_cards(
 
 
 def parse_tx_naver_table(text: str) -> pd.DataFrame:
-    """Format 1: '6월 23일 ... 27층 ... 10억 7,014'."""
+    """
+    네이버페이 실거래가 상세 표 파서.
+
+    특징
+    - 원문에 단지명이 없어도 UI의 `저장할 단지명`에 연결
+    - 정상적인 줄/탭 구분 표 지원
+    - 모바일 복사로 줄바꿈과 탭이 사라진 표 지원
+    - 계약취소/해지 행 제외
+    """
     text = normalize_raw_text(text)
-    if "실거래가 표" not in text and "계약일" not in text:
+
+    date_pattern = (
+        r"(?:1[0-2]|[1-9])월\s*"
+        r"(?:3[01]|[12]\d|[1-9])일"
+    )
+
+    if (
+        "실거래가" not in text
+        and "실거래가 표" not in text
+        and not (
+            "계약일" in text
+            and re.search(date_pattern, text)
+        )
+    ):
         return pd.DataFrame()
 
-    lines = [line.strip() for line in text.splitlines() if line.strip()]
+    # 월을 1~12, 일을 1~31로 제한합니다.
+    # 줄바꿈이 사라져 가격 숫자 바로 뒤에 날짜가 붙어도 날짜를 복원합니다.
+    event_pattern = re.compile(
+        r"(?P<year>20\d{2})년(?:\s*계약)?"
+        r"|(?P<month>1[0-2]|[1-9])월\s*"
+        r"(?P<day>3[01]|[12]\d|[1-9])일"
+    )
+    events = list(event_pattern.finditer(text))
+
+    if not events:
+        return pd.DataFrame()
+
+    records: List[Dict] = []
     current_year = datetime.now().year
-    records = []
-    index = 0
 
-    while index < len(lines):
-        line = lines[index]
-
-        year_match = re.search(r"(20\d{2})년", line)
-        if year_match:
-            current_year = int(year_match.group(1))
-
-        date_match = re.match(r"^(\d{1,2})월\s*(\d{1,2})일\b", line)
-        if not date_match:
-            index += 1
+    for event_index, event in enumerate(events):
+        if event.group("year"):
+            current_year = int(event.group("year"))
             continue
 
-        block_lines = [line]
-        cursor = index + 1
-        while cursor < len(lines):
-            next_line = lines[cursor]
-            if re.search(r"(20\d{2})년", next_line):
-                break
-            if re.match(r"^\d{1,2}월\s*\d{1,2}일\b", next_line):
-                break
-            block_lines.append(next_line)
-            cursor += 1
+        month = int(event.group("month"))
+        day = int(event.group("day"))
 
-        block = " ".join(block_lines)
-        index = cursor
-
-        if "계약취소" in block or "해지" in block:
-            continue
-
-        month, day = map(int, date_match.groups())
         if not is_valid_date(current_year, month, day):
             continue
 
-        floor_match = re.search(r"(\d{1,2})층", block)
-        price_match = re.search(EOK_AMOUNT_PATTERN, block)
-        if not floor_match or not price_match:
+        block_end = (
+            events[event_index + 1].start()
+            if event_index + 1 < len(events)
+            else len(text)
+        )
+        block = text[event.start():block_end]
+        compact_block = re.sub(r"\s+", " ", block).strip()
+
+        if re.search(r"계약\s*취소|계약취소|해지", compact_block):
+            continue
+
+        floor_match = re.search(
+            r"(?<!\d)(?P<floor>\d{1,2})층",
+            compact_block,
+        )
+        if not floor_match:
+            continue
+
+        # 페이지 상단의 최고/최저 통계값이 아니라
+        # 해당 거래의 층 뒤에 나오는 가격만 사용합니다.
+        after_floor = compact_block[floor_match.end():]
+        price_match = re.search(EOK_AMOUNT_PATTERN, after_floor)
+        if not price_match:
             continue
 
         records.append({
@@ -1393,93 +1442,269 @@ def parse_tx_naver_table(text: str) -> pd.DataFrame:
             "타입": "전체",
             "전용면적(㎡)": pd.NA,
             "금액_문자열": price_match.group(0).strip(),
-            "층": floor_match.group(1),
+            "층": floor_match.group("floor"),
             "동": "동미상",
-            "거래유형": "직거래" if "직거래" in block else "중개거래",
-            "권리유형": "분양권" if "분양권" in block else "매매",
+            "거래유형": (
+                "직거래"
+                if "직거래" in compact_block
+                else "중개거래"
+            ),
+            "권리유형": (
+                "분양권"
+                if "분양권" in compact_block
+                else "매매"
+            ),
             "데이터구분": "실거래",
             "파서형식": "실거래_네이버표",
-            "파싱신뢰도": 0.92,
+            "파싱신뢰도": 0.98,
+            "단지명출처": "사용자선택",
         })
 
-    return pd.DataFrame(records)
+    if not records:
+        return pd.DataFrame()
+
+    return pd.DataFrame(records).drop_duplicates(
+        subset=[
+            "날짜",
+            "층",
+            "금액_문자열",
+            "거래유형",
+            "권리유형",
+        ],
+        keep="first",
+    ).reset_index(drop=True)
 
 
-def parse_tx_vertical_list(text: str) -> pd.DataFrame:
+def extract_apt2_history_complex(text: str) -> str:
+    """아파트미 거래이력 제목에서 단지명을 추출합니다."""
+    patterns = [
+        (
+            r"(?m)^\s*#*\s*"
+            r"(?P<name>[0-9A-Za-z가-힣().·\-\s]{2,80}?)\s*"
+            r"분양권\s*실거래가\s*이력\s*$"
+        ),
+        (
+            r"(?m)^\s*#*\s*"
+            r"(?P<name>[0-9A-Za-z가-힣().·\-\s]{2,80}?)\s*"
+            r"\(입주예정\s*20\d{2}년\)\s*$"
+        ),
+    ]
+
+    for pattern in patterns:
+        match = re.search(pattern, text)
+        if match:
+            return match.group("name").strip()
+
+    return ""
+
+
+def parse_tx_vertical_list(
+    text: str,
+    expected_complex: Optional[str] = None,
+) -> pd.DataFrame:
     """
-    Format 3:
-      07.17
-      114.9694㎡ 47평 · 21층
-      분양권
-      15억7천238
+    아파트미 거래이력 목록형 파서 — 실거래 유형 3.
+
+    예:
+        2026년
+        07.17114.9694㎡ 47평 · 21층
+        분양권
+        15억7천238
+
+        2025년
+        12.2484.9914㎡ 34평 · 2층
+        분양권
+        10억3천500
+
+    연도는 블록 헤더에 한 번만 표시되고 각 거래행에는 MM.DD만 있으므로,
+    거래행 바로 앞의 유효한 연도 헤더를 각 행에 적용합니다.
     """
     text = normalize_raw_text(text)
-    lines = [line.strip() for line in text.splitlines() if line.strip()]
-    records = []
-    current_year = datetime.now().year
-    index = 0
 
-    while index < len(lines):
-        line = lines[index]
+    # 아파트미 상세 거래이력 페이지에만 적용합니다.
+    if "거래이력" not in text:
+        return pd.DataFrame()
 
-        year_match = re.search(r"(20\d{2})년", line)
-        if year_match:
-            current_year = int(year_match.group(1))
+    source_complex = extract_apt2_history_complex(text)
 
-        date_match = re.fullmatch(r"(\d{2})\.(\d{2})", line)
-        if not date_match:
-            index += 1
-            continue
-
-        block_lines = [line]
-        cursor = index + 1
-        while cursor < len(lines):
-            next_line = lines[cursor]
-            if re.search(r"(20\d{2})년", next_line):
-                break
-            if re.fullmatch(r"\d{2}\.\d{2}", next_line):
-                break
-            block_lines.append(next_line)
-            cursor += 1
-
-        block = "\n".join(block_lines)
-        index = cursor
-
-        if "해지" in block or "계약취소" in block:
-            continue
-
-        area_match = re.search(
-            r"(?P<area>\d+(?:\.\d+)?)(?:㎡|m2|m²)\s*"
-            r"(?P<pyung>\d+)(?P<suffix>[A-Za-z]?)평\s*·\s*"
-            r"(?P<floor>\d{1,2})층",
-            block,
+    if (
+        expected_complex
+        and source_complex
+        and not is_same_complex(
+            source_complex,
+            expected_complex,
         )
-        price_match = re.search(EOK_AMOUNT_PATTERN, block)
+    ):
+        return pd.DataFrame()
 
-        if not area_match or not price_match:
-            continue
+    month_day_pattern = (
+        r"(?:0[1-9]|1[0-2])\."
+        r"(?:0[1-9]|[12]\d|3[01])"
+    )
+    area_pattern = (
+        r"\d{2,3}(?:\.\d+)?"
+        r"(?:㎡|m2|m²)"
+    )
 
-        month, day = map(int, date_match.groups())
-        if not is_valid_date(current_year, month, day):
-            continue
+    # `입주예정 2026년`, `2026년 7월 기준`은 거래 연도로 쓰지 않습니다.
+    # 바로 뒤에 MM.DD + 면적 거래행이 나오는 연도만 유효한 블록 헤더입니다.
+    year_header_re = re.compile(
+        rf"\*{{0,2}}"
+        rf"(?P<year>20\d{{2}})년"
+        rf"\*{{0,2}}"
+        rf"(?=\s*{month_day_pattern}\s*{area_pattern})"
+    )
+    year_headers = list(
+        year_header_re.finditer(text)
+    )
 
-        suffix = area_match.group("suffix").upper()
-        records.append({
-            "날짜": f"{current_year:04d}.{month:02d}.{day:02d}",
-            "타입": normalize_type(area_match.group("area"), suffix),
-            "전용면적(㎡)": float(area_match.group("area")),
-            "평형": f"{area_match.group('pyung')}{suffix}",
-            "금액_문자열": price_match.group(0).strip(),
-            "층": area_match.group("floor"),
-            "동": "동미상",
-            "거래유형": "직거래" if "직거래" in block else "중개거래",
-            "권리유형": "분양권" if "분양권" in block else "매매",
-            "데이터구분": "실거래",
-            "파서형식": "실거래_세로목록",
-            "파싱신뢰도": 0.98,
-        })
+    if not year_headers:
+        return pd.DataFrame()
 
-    return pd.DataFrame(records)
+    # `07.17114.9694㎡`처럼 날짜와 면적이 붙은 형태도 인식합니다.
+    row_start_re = re.compile(
+        rf"\*{{0,2}}"
+        rf"(?P<date>{month_day_pattern})"
+        rf"\*{{0,2}}\s*"
+        rf"(?P<area>\d{{2,3}}(?:\.\d+)?)"
+        rf"(?:㎡|m2|m²)\s*"
+        rf"(?P<pyung>\d{{1,2}})"
+        rf"(?P<suffix>[A-Za-z]?)평\s*"
+        rf"[·ㆍ]\s*"
+        rf"(?P<floor>\d{{1,2}})층"
+    )
+
+    records: List[Dict] = []
+
+    for year_index, year_header in enumerate(
+        year_headers
+    ):
+        year = int(year_header.group("year"))
+
+        year_block_start = year_header.end()
+        year_block_end = (
+            year_headers[
+                year_index + 1
+            ].start()
+            if year_index + 1 < len(year_headers)
+            else len(text)
+        )
+        year_block = text[
+            year_block_start:year_block_end
+        ]
+
+        row_matches = list(
+            row_start_re.finditer(year_block)
+        )
+
+        for row_index, row_match in enumerate(
+            row_matches
+        ):
+            row_block_end = (
+                row_matches[
+                    row_index + 1
+                ].start()
+                if row_index + 1 < len(row_matches)
+                else len(year_block)
+            )
+            row_body = year_block[
+                row_match.end():row_block_end
+            ]
+            compact_body = re.sub(
+                r"\s+",
+                " ",
+                row_body,
+            ).strip()
+
+            # 해지 또는 계약취소 행은 제외합니다.
+            if re.search(
+                r"계약\s*취소|계약취소|해지",
+                compact_body,
+            ):
+                continue
+
+            price_match = re.search(
+                EOK_AMOUNT_PATTERN,
+                compact_body,
+            )
+            if not price_match:
+                continue
+
+            month, day = map(
+                int,
+                row_match.group(
+                    "date"
+                ).split("."),
+            )
+            if not is_valid_date(
+                year,
+                month,
+                day,
+            ):
+                continue
+
+            suffix = (
+                row_match.group(
+                    "suffix"
+                ).upper()
+            )
+
+            records.append({
+                "날짜": (
+                    f"{year:04d}."
+                    f"{month:02d}."
+                    f"{day:02d}"
+                ),
+                "타입": normalize_type(
+                    row_match.group("area"),
+                    suffix,
+                ),
+                "전용면적(㎡)": float(
+                    row_match.group("area")
+                ),
+                "평형": (
+                    f"{row_match.group('pyung')}"
+                    f"{suffix}"
+                ),
+                "금액_문자열": (
+                    price_match.group(0).strip()
+                ),
+                "층": row_match.group("floor"),
+                "동": "동미상",
+                "거래유형": (
+                    "직거래"
+                    if "직거래" in compact_body
+                    else "중개거래"
+                ),
+                "권리유형": (
+                    "분양권"
+                    if "분양권" in compact_body
+                    else "매매"
+                ),
+                "원문단지명": source_complex,
+                "데이터구분": "실거래",
+                "파서형식": "실거래_아파트미이력",
+                "파싱신뢰도": 0.99,
+                "연도출처": "거래이력_연도블록",
+            })
+
+    if not records:
+        return pd.DataFrame()
+
+    return (
+        pd.DataFrame(records)
+        .drop_duplicates(
+            subset=[
+                "날짜",
+                "타입",
+                "층",
+                "금액_문자열",
+                "거래유형",
+            ],
+            keep="first",
+        )
+        .reset_index(drop=True)
+    )
 
 
 
@@ -1627,7 +1852,7 @@ def parse_transactions(
 ) -> pd.DataFrame:
     frames = [
         parse_tx_naver_table(text),
-        parse_tx_vertical_list(text),
+        parse_tx_vertical_list(text, expected_complex),
         parse_tx_apt2_summary(text, expected_complex),
     ]
     frames = [frame for frame in frames if not frame.empty]
@@ -1677,6 +1902,43 @@ def parse_all_real_estate_text(
     if not rental_df.empty:
         detected.append("전월세")
 
+    naver_table_without_complex = bool(
+        not tx_df.empty
+        and "파서형식" in tx_df.columns
+        and tx_df["파서형식"].astype(str).eq(
+            "실거래_네이버표"
+        ).any()
+    )
+
+    apt2_history_detected = bool(
+        not tx_df.empty
+        and "파서형식" in tx_df.columns
+        and tx_df["파서형식"].astype(str).eq(
+            "실거래_아파트미이력"
+        ).any()
+    )
+
+    apt2_history_years = []
+    if (
+        apt2_history_detected
+        and "날짜" in tx_df.columns
+    ):
+        history_mask = (
+            tx_df["파서형식"]
+            .astype(str)
+            .eq("실거래_아파트미이력")
+        )
+        apt2_history_years = sorted(
+            {
+                str(value)[:4]
+                for value in tx_df.loc[
+                    history_mask,
+                    "날짜",
+                ].dropna()
+            },
+            reverse=True,
+        )
+
     report = {
         **property_report,
         "detected_types": detected,
@@ -1684,6 +1946,9 @@ def parse_all_real_estate_text(
         "sale_listing_count": len(sale_df),
         "rental_listing_count": len(rental_df),
         "unparsed": not detected,
+        "naver_table_without_complex": naver_table_without_complex,
+        "apt2_history_detected": apt2_history_detected,
+        "apt2_history_years": apt2_history_years,
     }
     return tx_df, sale_df, rental_df, report
 
@@ -2011,6 +2276,24 @@ remember_device_days = 180""",
         st.warning("다른 단지로 판단되어 제외: " + ", ".join(map(str, foreign)))
     if rejected:
         st.warning(f"필수 항목 부족으로 제외된 매물 후보: {rejected}건")
+
+    if report.get("naver_table_without_complex"):
+        st.info(
+            "네이버 상세 실거래가 원문에는 단지명이 포함되지 않습니다. "
+            f"인식된 실거래는 상단에서 선택한 **{complex_name}** 단지에 저장됩니다."
+        )
+
+    if report.get("apt2_history_detected"):
+        years = ", ".join(
+            report.get(
+                "apt2_history_years"
+            ) or []
+        )
+        st.info(
+            "아파트미 거래이력 형식을 인식했습니다. "
+            f"연도 블록({years})을 각 MM.DD 거래행에 적용했고, "
+            "해지·계약취소 이력은 자동 제외했습니다."
+        )
 
     selected = st.pills(
         "저장할 데이터 유형",
