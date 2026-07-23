@@ -8,7 +8,7 @@ import math
 import re
 import time
 import unicodedata
-from datetime import date, datetime, timedelta
+from datetime import date, datetime, timedelta, timezone
 from typing import Any, Dict, Iterable, List, Optional, Tuple
 
 import numpy as np
@@ -46,8 +46,14 @@ st.markdown(
 
     .block-container {
         max-width: 1440px;
-        padding-top: .9rem;
+        padding-top: 4.6rem;
         padding-bottom: 5rem;
+    }
+
+    header[data-testid="stHeader"] {
+        background: rgba(255,255,255,.96);
+        backdrop-filter: blur(12px);
+        border-bottom: 1px solid rgba(226,232,240,.78);
     }
 
     h1, h2, h3 {
@@ -243,7 +249,7 @@ st.markdown(
 
     @media (max-width: 768px) {
         .block-container {
-            padding: .55rem .72rem 5rem;
+            padding: 5.25rem .72rem 5rem;
         }
 
         .hero {
@@ -304,7 +310,7 @@ st.markdown(
     unsafe_allow_html=True,
 )
 
-APP_VERSION = "29.2"
+APP_VERSION = "29.3"
 SUPABASE_TABLE = "real_estate_records"
 DEFAULT_SUPABASE_URL = "https://lyxfwtwqwlujxszezkud.supabase.co"
 
@@ -471,14 +477,20 @@ DEVICE_STORAGE = st.components.v2.component(
         if (data.action === "write" && data.token) {
             localStorage.setItem(storageKey, data.token);
             token = data.token;
+            setStateValue("token", token);
             setTriggerValue("event", "written");
-        } else if (data.action === "clear") {
+            return;
+        }
+
+        if (data.action === "clear") {
             localStorage.removeItem(storageKey);
-            token = "";
+            setStateValue("token", "");
             setTriggerValue("event", "cleared");
+            return;
         }
 
         setStateValue("token", token);
+        setTriggerValue("event", "read");
     }
     """,
 )
@@ -505,7 +517,7 @@ def create_device_token() -> str:
     days = int(config.get("remember_device_days", 180) or 180)
     payload = {
         "v": 1,
-        "exp": int((datetime.utcnow() + timedelta(days=days)).timestamp()),
+        "exp": int((datetime.now(timezone.utc) + timedelta(days=days)).timestamp()),
     }
     body = b64url_encode(
         json.dumps(payload, separators=(",", ":")).encode("utf-8")
@@ -529,7 +541,7 @@ def verify_device_token(token: str) -> bool:
         if not hmac.compare_digest(signature, expected):
             return False
         payload = json.loads(b64url_decode(body).decode("utf-8"))
-        return int(payload.get("exp", 0)) > int(datetime.utcnow().timestamp())
+        return int(payload.get("exp", 0)) > int(datetime.now(timezone.utc).timestamp())
     except Exception:
         return False
 
@@ -539,6 +551,7 @@ def init_auth_state() -> None:
         "admin_authenticated": False,
         "device_storage_action": "read",
         "device_storage_token": "",
+        "device_storage_loaded": False,
     }
     for key, value in defaults.items():
         st.session_state.setdefault(key, value)
@@ -547,6 +560,16 @@ def init_auth_state() -> None:
 def mount_device_storage() -> None:
     action = st.session_state.get("device_storage_action", "read")
     pending_token = st.session_state.get("device_storage_token", "")
+    loaded = bool(st.session_state.get("device_storage_loaded", False))
+
+    if (
+        action == "read"
+        and (
+            loaded
+            or st.session_state.get("admin_authenticated", False)
+        )
+    ):
+        return
 
     result = DEVICE_STORAGE(
         key="device_auth_storage_mount",
@@ -555,21 +578,30 @@ def mount_device_storage() -> None:
             "action": action,
             "token": pending_token,
         },
-        default={"token": ""},
+        default={"token": "", "event": ""},
         on_token_change=lambda: None,
         on_event_change=lambda: None,
     )
 
     token = getattr(result, "token", "") or ""
+    event = getattr(result, "event", "") or ""
 
-    if action == "write" and token == pending_token and token:
-        st.session_state["device_storage_action"] = "read"
-    elif action == "clear" and not token:
+    if event == "read":
+        st.session_state["device_storage_loaded"] = True
+        if token and verify_device_token(token):
+            st.session_state["admin_authenticated"] = True
+
+    elif event == "written":
+        st.session_state["device_storage_loaded"] = True
         st.session_state["device_storage_action"] = "read"
         st.session_state["device_storage_token"] = ""
+        if token and verify_device_token(token):
+            st.session_state["admin_authenticated"] = True
 
-    if token and verify_device_token(token):
-        st.session_state["admin_authenticated"] = True
+    elif event == "cleared":
+        st.session_state["device_storage_loaded"] = True
+        st.session_state["device_storage_action"] = "read"
+        st.session_state["device_storage_token"] = ""
 
 
 def is_admin_authenticated() -> bool:
@@ -616,6 +648,7 @@ def render_admin_login() -> bool:
         if hmac.compare_digest(password, configured_password):
             st.session_state["admin_authenticated"] = True
             if remember:
+                st.session_state["device_storage_loaded"] = False
                 st.session_state["device_storage_action"] = "write"
                 st.session_state["device_storage_token"] = create_device_token()
             st.toast("관리자 인증이 완료되었습니다.", icon="✅")
@@ -628,6 +661,7 @@ def render_admin_login() -> bool:
 
 def logout_device() -> None:
     st.session_state["admin_authenticated"] = False
+    st.session_state["device_storage_loaded"] = False
     st.session_state["device_storage_action"] = "clear"
     st.session_state["device_storage_token"] = ""
     st.rerun()
@@ -1515,8 +1549,7 @@ def ingest_key(name: str) -> str:
 def init_ingest_state() -> None:
     defaults = {
         "input_version": 0,
-        "changed_at": 0.0,
-        "last_auto_hash": "",
+        "auto_parse_pending": False,
         "preview_hash": "",
         "preview_tx": pd.DataFrame(),
         "preview_sale": pd.DataFrame(),
@@ -1535,7 +1568,6 @@ def reset_preview(*, clear_text: bool) -> None:
     st.session_state[ingest_key("preview_sale")] = pd.DataFrame()
     st.session_state[ingest_key("preview_rental")] = pd.DataFrame()
     st.session_state[ingest_key("preview_report")] = {}
-    st.session_state[ingest_key("last_auto_hash")] = ""
 
     if clear_text:
         current_key = st.session_state.get("active_raw_widget_key")
@@ -1545,7 +1577,7 @@ def reset_preview(*, clear_text: bool) -> None:
 
 
 def mark_raw_changed() -> None:
-    st.session_state[ingest_key("changed_at")] = time.time()
+    st.session_state[ingest_key("auto_parse_pending")] = True
 
 
 def run_screening(raw_text: str, complex_name: str) -> None:
@@ -1565,28 +1597,7 @@ def run_screening(raw_text: str, complex_name: str) -> None:
     st.session_state[ingest_key("preview_sale")] = sale_df
     st.session_state[ingest_key("preview_rental")] = rental_df
     st.session_state[ingest_key("preview_report")] = report
-    st.session_state[ingest_key("last_auto_hash")] = text_hash
 
-
-@st.fragment(run_every=.5)
-def auto_screening_fragment(raw_widget_key: str, complex_name: str) -> None:
-    raw_text = str(st.session_state.get(raw_widget_key, "") or "")
-    if not raw_text.strip():
-        return
-
-    current_hash = hashlib.sha256(raw_text.encode("utf-8")).hexdigest()
-    if current_hash == st.session_state.get(ingest_key("last_auto_hash"), ""):
-        return
-
-    elapsed = time.time() - float(
-        st.session_state.get(ingest_key("changed_at"), 0) or 0
-    )
-    if elapsed < 2:
-        st.caption(f"자동 판독 대기 중 · {max(0, 2 - elapsed):.1f}초")
-        return
-
-    run_screening(raw_text, complex_name)
-    st.rerun()
 
 
 def detected_categories() -> list[str]:
@@ -1727,7 +1738,7 @@ remember_device_days = 180""",
         """
         <div class="step-strip">
             <div class="step"><div class="step-no">STEP 1</div><div class="step-title">원문 붙여넣기</div></div>
-            <div class="step"><div class="step-no">STEP 2</div><div class="step-title">자동 판독 확인</div></div>
+            <div class="step"><div class="step-no">STEP 2</div><div class="step-title">판독 결과 확인</div></div>
             <div class="step"><div class="step-no">STEP 3</div><div class="step-title">저장 버튼 누르기</div></div>
         </div>
         """,
@@ -1756,6 +1767,15 @@ remember_device_days = 180""",
         label_visibility="collapsed",
     )
 
+    auto_processed = False
+    if (
+        st.session_state.pop(ingest_key("auto_parse_pending"), False)
+        and raw_text.strip()
+    ):
+        with st.spinner("입력 내용을 한 번만 판독하고 있습니다…"):
+            run_screening(raw_text, complex_name)
+        auto_processed = True
+
     analyze_col, clear_col = st.columns([2, 1])
     with analyze_col:
         analyze_clicked = st.button(
@@ -1773,12 +1793,9 @@ remember_device_days = 180""",
             reset_preview(clear_text=True)
             st.rerun()
 
-    if analyze_clicked:
-        with st.spinner("매매·전월세·실거래 형식을 분석하고 있습니다…"):
+    if analyze_clicked and not auto_processed:
+        with st.spinner("매매·전월세·실거래 형식을 한 번만 분석하고 있습니다…"):
             run_screening(raw_text, complex_name)
-        st.rerun()
-
-    auto_screening_fragment(raw_widget_key, complex_name)
 
     preview_hash = st.session_state.get(ingest_key("preview_hash"), "")
     current_hash = (
@@ -1790,7 +1807,7 @@ remember_device_days = 180""",
     if not preview_hash or preview_hash != current_hash:
         st.info(
             "원문을 붙여넣은 뒤 **내용 판독하기**를 누르세요. "
-            "입력창 밖을 누르면 2초 후 자동 판독도 실행됩니다."
+            "입력창 밖을 누르거나 Ctrl+Enter를 눌러도 한 번만 자동 판독됩니다."
         )
         return
 
