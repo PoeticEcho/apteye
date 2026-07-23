@@ -310,7 +310,7 @@ st.markdown(
     unsafe_allow_html=True,
 )
 
-APP_VERSION = "29.4"
+APP_VERSION = "29.5"
 SUPABASE_TABLE = "real_estate_records"
 DEFAULT_SUPABASE_URL = "https://lyxfwtwqwlujxszezkud.supabase.co"
 
@@ -757,16 +757,105 @@ def clear_data_caches() -> None:
     st.cache_data.clear()
 
 
+def apt2_transaction_identity(
+    payload: dict,
+) -> Optional[Tuple[str, str, str, str]]:
+    """아파트미 당일 신고 레코드의 수정 교체용 식별자."""
+    if str(payload.get("파서형식") or "") != "실거래_아파트미요약":
+        return None
+
+    return (
+        str(payload.get("날짜") or "").strip(),
+        str(payload.get("타입") or "").strip(),
+        str(payload.get("층") or "").strip(),
+        str(payload.get("거래유형") or "").strip(),
+    )
+
+
+def remove_stale_apt2_transactions(
+    client: Client,
+    complex_name: str,
+    incoming_rows: List[dict],
+) -> int:
+    """
+    동일 날짜·타입·층·거래유형의 과거 아파트미 요약 행 중
+    현재 수정본과 해시가 다른 행을 삭제합니다.
+    """
+    incoming_by_identity: Dict[
+        Tuple[str, str, str, str],
+        str,
+    ] = {}
+
+    for row in incoming_rows:
+        identity = apt2_transaction_identity(
+            row.get("payload") or {}
+        )
+        if identity:
+            incoming_by_identity[identity] = str(
+                row.get("record_hash") or ""
+            )
+
+    if not incoming_by_identity:
+        return 0
+
+    response = (
+        client.table(SUPABASE_TABLE)
+        .select("record_hash,payload")
+        .eq("complex_name", complex_name)
+        .eq("category", CATEGORY_TX)
+        .execute()
+    )
+
+    stale_hashes: List[str] = []
+
+    for existing in response.data or []:
+        payload = existing.get("payload") or {}
+        identity = apt2_transaction_identity(payload)
+
+        if not identity or identity not in incoming_by_identity:
+            continue
+
+        existing_hash = str(
+            existing.get("record_hash") or ""
+        )
+        incoming_hash = incoming_by_identity[identity]
+
+        if existing_hash and existing_hash != incoming_hash:
+            stale_hashes.append(existing_hash)
+
+    for stale_hash in stale_hashes:
+        (
+            client.table(SUPABASE_TABLE)
+            .delete()
+            .eq("record_hash", stale_hash)
+            .execute()
+        )
+
+    return len(stale_hashes)
+
+
 def upsert_dataframe(
     df: pd.DataFrame,
     complex_name: str,
     category: str,
 ) -> int:
-    rows = dataframe_to_supabase_rows(df, complex_name, category)
+    rows = dataframe_to_supabase_rows(
+        df,
+        complex_name,
+        category,
+    )
     if not rows:
         return 0
 
     client = supabase_client()
+
+    if category == CATEGORY_TX:
+        remove_stale_apt2_transactions(
+            client,
+            complex_name,
+            rows,
+        )
+
     for start in range(0, len(rows), 250):
         client.table(SUPABASE_TABLE).upsert(
             rows[start:start + 250],
@@ -1413,32 +1502,77 @@ def find_nearest_apt2_complex(text: str, position: int) -> Optional[str]:
             return match.group("name").strip()
     return None
 
+def find_apt2_price_before_transaction(
+    text: str,
+    transaction_start: int,
+    *,
+    max_lookback: int = 420,
+    max_distance: int = 170,
+) -> Optional[str]:
+    """
+    아파트미 요약 카드에서 면적 행 바로 앞의 실제 거래가격을 찾습니다.
+
+    `타입최고`, `평형최고` 등 통계 가격은 제외하고,
+    거래 상세행과 가장 가까운 가격만 채택합니다.
+    """
+    window_start = max(0, transaction_start - max_lookback)
+    window = text[window_start:transaction_start]
+    candidates: List[Tuple[int, str]] = []
+
+    for price_match in re.finditer(EOK_AMOUNT_PATTERN, window):
+        distance = len(window) - price_match.end()
+        if distance > max_distance:
+            continue
+
+        line_start = window.rfind("\n", 0, price_match.start()) + 1
+        same_line_prefix = window[line_start:price_match.start()].strip()
+
+        # 통계/참고가격은 실거래 가격으로 사용하지 않음
+        if re.search(
+            r"(?:타입최고|평형최고|2년\s*내\s*최고|2년\s*내\s*최저|"
+            r"최고가대비|최고가|최저가)\s*$",
+            same_line_prefix,
+        ):
+            continue
+
+        candidates.append((distance, price_match.group(0).strip()))
+
+    if not candidates:
+        return None
+
+    # 상세 거래행과 거리가 가장 짧은 가격을 선택
+    candidates.sort(key=lambda item: item[0])
+    return candidates[0][1]
+
+
 def parse_tx_apt2_summary(
     text: str,
     expected_complex: Optional[str] = None,
 ) -> pd.DataFrame:
     """
-    Format 2, including a page that has multiple apartment cards.
-    Only a card whose preceding context matches expected_complex is accepted.
+    아파트미 당일 신고 요약형 파서.
+
+    거래 상세행(면적·층·거래유형·계약일)을 먼저 찾은 뒤,
+    그 행 바로 앞의 실제 신고가격을 역방향으로 연결합니다.
+    카드 아래의 `타입최고`, `평형최고` 가격은 제외합니다.
     """
     text = normalize_raw_text(text)
     if "계약" not in text or not re.search(r"(?:㎡|m2|m²)", text):
         return pd.DataFrame()
 
-    pattern = re.compile(
-        rf"(?P<price>{EOK_AMOUNT_PATTERN})"
-        rf"(?P<middle>.{{0,180}}?)"
-        rf"(?P<area>\d+(?:\.\d+)?)(?:㎡|m2|m²)"
-        rf"(?P<rest>.{{0,120}}?)"
-        rf"(?P<floor>\d{{1,2}})층\s*"
-        rf"(?P<deal>중개거래|직거래)"
-        rf".{{0,80}}?"
-        rf"(?P<date>\d{{2}}\.\d{{2}}\.\d{{2}})\s*계약",
+    transaction_pattern = re.compile(
+        r"(?P<area>\d+(?:\.\d+)?)(?:㎡|m2|m²)"
+        r"(?P<rest>.{0,150}?)"
+        r"(?P<floor>\d{1,2})층\s*"
+        r"(?P<deal>중개거래|직거래)"
+        r".{0,90}?"
+        r"(?P<date>\d{2}\.\d{2}\.\d{2})\s*계약",
         re.S,
     )
 
     records = []
-    for match in pattern.finditer(text):
+
+    for match in transaction_pattern.finditer(text):
         if expected_complex:
             nearest_complex = find_nearest_apt2_complex(text, match.start())
             if nearest_complex:
@@ -1450,23 +1584,38 @@ def parse_tx_apt2_summary(
                 if expected_key not in canonical_complex_name(context):
                     continue
 
+        price_text = find_apt2_price_before_transaction(
+            text,
+            match.start(),
+        )
+        if not price_text:
+            continue
+
         yy, month, day = map(int, match.group("date").split("."))
         year = 2000 + yy
         if not is_valid_date(year, month, day):
             continue
 
+        nearby_context = text[
+            max(0, match.start() - 500):match.end()
+        ]
+
         records.append({
             "날짜": f"{year:04d}.{month:02d}.{day:02d}",
             "타입": normalize_type(match.group("area")),
             "전용면적(㎡)": float(match.group("area")),
-            "금액_문자열": match.group("price").strip(),
+            "금액_문자열": price_text,
             "층": match.group("floor"),
             "동": "동미상",
             "거래유형": match.group("deal"),
-            "권리유형": "분양권" if "분양권" in text[max(0, match.start()-500):match.end()] else "매매",
+            "권리유형": (
+                "분양권"
+                if "분양권" in nearby_context
+                else "매매"
+            ),
             "데이터구분": "실거래",
             "파서형식": "실거래_아파트미요약",
-            "파싱신뢰도": 0.90,
+            "파싱신뢰도": 0.98,
         })
 
     return pd.DataFrame(records)
